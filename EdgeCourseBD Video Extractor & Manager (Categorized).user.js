@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         EdgeCourseBD Video Extractor & Manager (Categorized)
+// @name         EdgeCourseBD Video Extractor & Manager (Categorized + Search + Sort)
 // @namespace    http://tampermonkey.net/
-// @version      2.1
-// @description  Extracts Vimeo links from EdgeCourseBD, categorizes them, and provides a lightweight GUI.
+// @version      3.0
+// @description  Extracts Vimeo links, categorizes them, with ultra-fast search and sorting.
 // @author       Your Local Linux Engineer
 // @match        *://*.edgecoursebd.com/*
 // @grant        GM_setValue
@@ -29,11 +29,22 @@
             display: none; position: fixed; top: 10%; left: 10%; width: 80%; max-height: 80%;
             background: #181825; border: 2px solid #89b4fa; border-radius: 10px;
             z-index: 1000000; padding: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.8);
-            font-family: monospace; color: #cdd6f4; overflow-y: auto;
+            font-family: monospace; color: #cdd6f4; overflow-y: hidden;
+            display: flex; flex-direction: column;
         }
         
-        #vid-collector-modal h2 { margin-top: 0; color: #89b4fa; border-bottom: 1px solid #45475a; padding-bottom: 10px; }
-        .vid-controls { margin-bottom: 15px; display: flex; gap: 10px; }
+        #vid-collector-modal h2 { margin-top: 0; color: #89b4fa; border-bottom: 1px solid #45475a; padding-bottom: 10px; flex-shrink: 0;}
+        
+        .vid-top-bar { display: flex; gap: 10px; margin-bottom: 15px; flex-shrink: 0; }
+        .vid-input {
+            background: #1e1e2e; color: #cdd6f4; border: 1px solid #585b70;
+            padding: 8px; border-radius: 4px; font-family: monospace; outline: none;
+        }
+        .vid-input:focus { border-color: #89b4fa; }
+        #vid-search { flex-grow: 1; }
+        #vid-sort { cursor: pointer; width: 200px;}
+        
+        .vid-controls { margin-bottom: 10px; display: flex; gap: 10px; flex-shrink: 0; }
         .vid-btn { 
             background: #313244; color: #cdd6f4; border: 1px solid #585b70; 
             padding: 8px 12px; cursor: pointer; border-radius: 4px; font-family: monospace;
@@ -42,6 +53,8 @@
         .vid-btn.copy-btn { border-color: #a6e3a1; color: #a6e3a1; }
         .vid-btn.copy-btn:hover { background: #a6e3a1; color: #181825; }
         .vid-btn.danger-btn { border-color: #f38ba8; color: #f38ba8; }
+        
+        #vid-list-container { flex-grow: 1; overflow-y: auto; padding-right: 5px; }
         
         /* Category Accordion Styles */
         .vid-category-group { margin-bottom: 10px; border: 1px solid #313244; border-radius: 6px; overflow: hidden; }
@@ -60,13 +73,19 @@
         .vid-table tr:hover { background: #1e1e2e; }
         
         .vid-checkbox { cursor: pointer; transform: scale(1.2); }
-        .vid-close { position: absolute; top: 15px; right: 20px; cursor: pointer; font-size: 20px; color: #f38ba8; }
+        .vid-close { position: absolute; top: 15px; right: 20px; cursor: pointer; font-size: 20px; color: #f38ba8; z-index: 2; }
         
         #vid-toast {
             display: none; position: fixed; top: 20px; left: 50%; transform: translateX(-50%);
             background: #a6e3a1; color: #181825; padding: 10px 20px; border-radius: 5px;
             z-index: 1000001; font-weight: bold; font-family: monospace;
         }
+        
+        /* Scrollbar styling for XFCE look */
+        #vid-list-container::-webkit-scrollbar { width: 8px; }
+        #vid-list-container::-webkit-scrollbar-track { background: #181825; }
+        #vid-list-container::-webkit-scrollbar-thumb { background: #45475a; border-radius: 4px; }
+        #vid-list-container::-webkit-scrollbar-thumb:hover { background: #585b70; }
     `);
 
     /* --- DOM ELEMENTS --- */
@@ -76,19 +95,33 @@
 
     const modal = document.createElement('div');
     modal.id = 'vid-collector-modal';
+    // Modal is initially fully hidden via style inline below, but block locally in html
+    modal.style.display = 'none';
     modal.innerHTML = `
         <span class="vid-close" id="vid-close-btn">✖</span>
-        <h2>📼 Captured Videos (Categorized)</h2>
+        <h2>📼 Captured Videos</h2>
+        
+        <div class="vid-top-bar">
+            <input type="text" id="vid-search" class="vid-input" placeholder="🔍 Search video names or categories...">
+            <select id="vid-sort" class="vid-input">
+                <option value="date-asc">Sort: Oldest First (Default)</option>
+                <option value="date-desc">Sort: Newest First</option>
+                <option value="name-asc">Sort: Name (A-Z)</option>
+            </select>
+        </div>
+
         <div class="vid-controls">
             <button class="vid-btn" id="vid-select-all">Select All</button>
-            <button class="vid-btn copy-btn" id="vid-copy-names">Copy Names (;)</button>
-            <button class="vid-btn copy-btn" id="vid-copy-links">Copy Links (;)</button>
+            <button class="vid-btn copy-btn" id="vid-copy-names">Copy Names</button>
+            <button class="vid-btn copy-btn" id="vid-copy-links">Copy Links</button>
             <button class="vid-btn danger-btn" id="vid-clear-all" style="margin-left:auto;">Clear DB</button>
         </div>
-        <div style="margin-bottom: 10px; display: flex; align-items: center; gap: 10px;">
+
+        <div style="margin-bottom: 10px; display: flex; align-items: center; gap: 10px; flex-shrink: 0;">
             <input type="checkbox" id="vid-master-checkbox" class="vid-checkbox"> 
-            <span style="color:#cdd6f4; font-size: 14px;">Master Checkbox (Toggle All)</span>
+            <span style="color:#cdd6f4; font-size: 14px;">Toggle Selection</span>
         </div>
+
         <div id="vid-list-container"></div>
     `;
     document.body.appendChild(modal);
@@ -114,8 +147,11 @@
     function renderCategories() {
         const db = GM_getValue('edgeVids', {});
         const container = document.getElementById('vid-list-container');
-        container.innerHTML = '';
+        const sortMethod = document.getElementById('vid-sort').value;
+        
+        container.innerHTML = ''; // Clear current view
 
+        // 1. Group data into categories
         const grouped = {};
         for (const[name, data] of Object.entries(db)) {
             if (name.trim() === "") continue;
@@ -124,12 +160,25 @@
             grouped[cat][name] = data;
         }
 
+        // 2. Build DOM for each category
         for (const[catName, vids] of Object.entries(grouped)) {
             const vidCount = Object.keys(vids).length;
             const safeCatName = catName.replace(/"/g, '&quot;');
             
+            // Array-ify and sort items INSIDE the category
+            let vidArray = Object.entries(vids);
+            if (sortMethod === 'name-asc') {
+                vidArray.sort((a, b) => a[0].localeCompare(b[0]));
+            } else if (sortMethod === 'date-desc') {
+                vidArray.sort((a, b) => (b[1].savedAt || 0) - (a[1].savedAt || 0));
+            } else { // date-asc
+                vidArray.sort((a, b) => (a[1].savedAt || 0) - (b[1].savedAt || 0));
+            }
+            
             const groupDiv = document.createElement('div');
             groupDiv.className = 'vid-category-group';
+            // Store raw text for fast search
+            groupDiv.dataset.catName = catName.toLowerCase();
             
             const header = document.createElement('div');
             header.className = 'vid-category-header';
@@ -143,9 +192,9 @@
             content.className = 'vid-category-content';
             
             let tableHTML = `<table class="vid-table"><tbody class="vid-tbody">`;
-            for (const [name, data] of Object.entries(vids)) {
+            for (const [name, data] of vidArray) {
                 tableHTML += `
-                    <tr>
+                    <tr data-vid-name="${name.replace(/"/g, '&quot;').toLowerCase()}">
                         <td style="width: 30px; text-align: center;">
                             <input type="checkbox" class="vid-checkbox row-checkbox" data-category="${safeCatName}" data-name="${name.replace(/"/g, '&quot;')}">
                         </td>
@@ -169,35 +218,85 @@
             const catCheckbox = header.querySelector('.cat-checkbox');
             catCheckbox.addEventListener('change', (e) => {
                 const isChecked = e.target.checked;
-                content.querySelectorAll('.row-checkbox').forEach(cb => cb.checked = isChecked);
+                // Only toggle checkboxes that are currently visible (important if search is active)
+                content.querySelectorAll('.row-checkbox').forEach(cb => {
+                    if (cb.closest('tr').style.display !== 'none') {
+                        cb.checked = isChecked;
+                    }
+                });
             });
 
             groupDiv.appendChild(header);
             groupDiv.appendChild(content);
             container.appendChild(groupDiv);
         }
+        
+        // Re-apply search filter if the user sorted while a search query was typed
+        triggerSearch();
     }
 
-    // Extraction Logic
+    // Ultra-fast in-memory DOM search
+    function triggerSearch() {
+        const term = document.getElementById('vid-search').value.toLowerCase();
+        const groups = document.querySelectorAll('.vid-category-group');
+
+        groups.forEach(group => {
+            const catName = group.dataset.catName;
+            const rows = group.querySelectorAll('tbody tr');
+            let hasVisibleRow = false;
+
+            // If the category name itself matches the search, show all rows inside it
+            const categoryMatches = catName.includes(term);
+
+            rows.forEach(row => {
+                const vidName = row.dataset.vidName;
+                if (categoryMatches || vidName.includes(term)) {
+                    row.style.display = '';
+                    hasVisibleRow = true;
+                } else {
+                    row.style.display = 'none';
+                }
+            });
+
+            // Hide the entire category if no rows match
+            if (!hasVisibleRow) {
+                group.style.display = 'none';
+            } else {
+                group.style.display = '';
+                // Auto-expand if the user typed something
+                const content = group.querySelector('.vid-category-content');
+                const toggle = group.querySelector('.vid-cat-toggle');
+                const header = group.querySelector('.vid-category-header');
+                
+                if (term !== '') {
+                    content.style.display = 'block';
+                    toggle.textContent = '▼';
+                    header.style.borderBottomColor = 'transparent';
+                } else {
+                    // Collapse back if search is empty
+                    content.style.display = 'none';
+                    toggle.textContent = '▶';
+                    header.style.borderBottomColor = '#313244';
+                }
+            }
+        });
+    }
+
+    // Extraction Logic (Silent background polling)
     function scanForVideo() {
         const iframe = document.querySelector('iframe[src*="player.vimeo.com"]');
         const selectedContainer = document.querySelector('div.bg-brand-100');
         
         if (iframe && selectedContainer) {
             const titleEl = selectedContainer.querySelector('span.course_tab_text');
-            
             if (titleEl) {
                 const title = titleEl.textContent.trim();
                 const link = iframe.src;
 
                 if (title !== "") {
                     let categoryName = "Uncategorized";
-                    
-                    // FIXED LOGIC: Find the exact content wrapper (role="region"), then check its parent
                     const regionDiv = selectedContainer.closest('div[role="region"]');
-                    
                     if (regionDiv && regionDiv.parentElement) {
-                        // We are now safely at the root Accordion Item, looking for the header
                         const catTitleEl = regionDiv.parentElement.querySelector('h3 .course_tab_text');
                         if (catTitleEl) {
                             categoryName = catTitleEl.textContent.trim();
@@ -206,13 +305,12 @@
 
                     const db = GM_getValue('edgeVids', {});
                     
-                    // Will auto-correct old bad categories!
                     if (!db[title] || db[title].link !== link || db[title].category !== categoryName) {
                         db[title] = {
                             link: link,
                             category: categoryName,
                             page: window.location.href,
-                            savedAt: Date.now()
+                            savedAt: Date.now() // Timestamps used for sorting!
                         };
                         GM_setValue('edgeVids', db);
                         updateBtnCounter();
@@ -227,20 +325,37 @@
 
     btn.addEventListener('click', () => {
         renderCategories();
-        modal.style.display = 'block';
+        modal.style.display = 'flex'; // Changed to flex for proper layout handling
     });
     
     document.getElementById('vid-close-btn').addEventListener('click', () => {
         modal.style.display = 'none';
     });
 
+    // Search Box Listener
+    document.getElementById('vid-search').addEventListener('input', triggerSearch);
+    
+    // Dropdown Sort Listener
+    document.getElementById('vid-sort').addEventListener('change', renderCategories);
+
     document.getElementById('vid-master-checkbox').addEventListener('change', (e) => {
         const isChecked = e.target.checked;
-        document.querySelectorAll('.cat-checkbox, .row-checkbox').forEach(cb => cb.checked = isChecked);
+        // Only select items that aren't hidden by the search
+        document.querySelectorAll('.cat-checkbox, .row-checkbox').forEach(cb => {
+            const tr = cb.closest('tr');
+            if (!tr || tr.style.display !== 'none') {
+                cb.checked = isChecked;
+            }
+        });
     });
 
     document.getElementById('vid-select-all').addEventListener('click', () => {
-        document.querySelectorAll('.cat-checkbox, .row-checkbox').forEach(cb => cb.checked = true);
+        document.querySelectorAll('.cat-checkbox, .row-checkbox').forEach(cb => {
+            const tr = cb.closest('tr');
+            if (!tr || tr.style.display !== 'none') {
+                 cb.checked = true;
+            }
+        });
         document.getElementById('vid-master-checkbox').checked = true;
     });
 
@@ -266,6 +381,7 @@
             GM_setValue('edgeVids', {});
             renderCategories();
             updateBtnCounter();
+            document.getElementById('vid-search').value = '';
             showToast("🗑️ Database Cleared!");
         }
     });
