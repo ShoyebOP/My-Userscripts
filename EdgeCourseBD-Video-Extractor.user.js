@@ -3,7 +3,9 @@
 // @namespace    http://tampermonkey.net/
 // @version      3.0
 // @description  Extracts Vimeo links, categorizes them, with ultra-fast search and sorting.
-// @author       Your Local Linux Engineer
+// @author       ShoyebOP
+// @downloadURL  https://github.com/ShoyebOP/My-Userscripts/raw/refs/heads/main/EdgeCourseBD-Video-Extractor.user.js
+// @updateURL    https://github.com/ShoyebOP/My-Userscripts/raw/refs/heads/main/EdgeCourseBD-Video-Extractor.user.js
 // @match        *://*.edgecoursebd.com/*
 // @grant        GM_setValue
 // @grant        GM_getValue
