@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EdgeCourseBD Video Extractor & Manager (Categorized + Search + Sort)
 // @namespace    http://tampermonkey.net/
-// @version      3.0
+// @version      3.1
 // @description  Extracts Vimeo links, categorizes them, with ultra-fast search and sorting.
 // @author       ShoyebOP
 // @downloadURL  https://github.com/ShoyebOP/My-Userscripts/raw/refs/heads/main/EdgeCourseBD-Video-Extractor.user.js
@@ -361,10 +361,14 @@
         document.getElementById('vid-master-checkbox').checked = true;
     });
 
+    function cleanName(name) {
+        return name.replace(/[,;|]/g, '_').replace(/_+/g, '_').trim();
+    }
+
     document.getElementById('vid-copy-names').addEventListener('click', () => {
-        const selected = Array.from(document.querySelectorAll('.row-checkbox:checked')).map(cb => cb.dataset.name);
+        const selected = Array.from(document.querySelectorAll('.row-checkbox:checked')).map(cb => cleanName(cb.dataset.name));
         if (selected.length === 0) return showToast("⚠️ Nothing selected!");
-        GM_setClipboard(selected.join(';'));
+        GM_setClipboard(selected.join(' | '));
         showToast(`✅ Copied ${selected.length} names!`);
     });
 
@@ -374,7 +378,7 @@
         if (selectedNames.length === 0) return showToast("⚠️ Nothing selected!");
         
         const links = selectedNames.map(name => db[name].link);
-        GM_setClipboard(links.join(';'));
+        GM_setClipboard(links.join(' | '));
         showToast(`✅ Copied ${links.length} links!`);
     });
 
