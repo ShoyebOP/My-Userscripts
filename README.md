@@ -1,3 +1,6 @@
+# Switched from github
+new repo: https://codeberg.org/ShoyebOP/My-Userscripts/settings
+
 # My-Userscripts
 This repository contains the userscripts i made
 
