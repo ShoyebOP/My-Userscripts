@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         AI Studio Performance Booster V4.1 (URL Fix)
+// @name         AI Studio Performance Booster V4.2 (Visual Optimizer)
 // @namespace    http://tampermonkey.net/
-// @version      4.1
-// @description  Physically removes old chat content to save RAM.
+// @version      4.2
+// @description  Physically removes old chat content to save RAM + blocks animations/transitions/3D for better performance.
 // @author       ShoyebOP
 // @match        https://aistudio.google.com/*
 // @match        https://www.aistudio.google.com/*
@@ -28,6 +28,41 @@
     }
 
     // --- CSS ---
+    // Performance: Block animations, transitions, and 3D effects
+    const perfCss = `
+        /* Disable all CSS transitions (except on our toggle button) */
+        *:not(#shoyeb-toggle-btn):not(#shoyeb-toggle-btn *) {
+            transition: none !important;
+        }
+
+        /* Disable all CSS animations */
+        *:not(#shoyeb-toggle-btn):not(#shoyeb-toggle-btn *) {
+            animation: none !important;
+        }
+
+        /* Block Angular animation triggers */
+        [ng-trigger],
+        [ng-trigger] * {
+            transition: none !important;
+            animation: none !important;
+        }
+
+        /* Enforce flat transform style (no 3D) */
+        * {
+            transform-style: flat !important;
+            backface-visibility: visible !important;
+        }
+
+        /* Disable smooth scroll */
+        html {
+            scroll-behavior: auto !important;
+        }
+    `;
+
+    const perfStyle = document.createElement('style');
+    perfStyle.appendChild(document.createTextNode(perfCss));
+    document.head.appendChild(perfStyle);
+
     // Style for the "placeholder" that replaces the heavy chat
     const css = `
         .shoyeb-placeholder {
