@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EdgeCourseBD Video Extractor & Manager (Categorized + Search + Sort)
 // @namespace    http://tampermonkey.net/
-// @version      4.7
-// @description  Extracts Vimeo / Tenbyte-Vidinfra (tb-player) links, auto-categorizes nested Course Content > Academic Class > Subject (all parents, Academic Classes - stripped) - nested UI fix.
+// @version      4.9
+// @description  Extracts Vimeo / Tenbyte-Vidinfra (tb-player) links, auto-categorizes nested Course Content > Academic Class > Subject (all parents, Academic Classes - stripped) - full hierarchy fix.
 // @author       ShoyebOP
 // @downloadURL  https://github.com/ShoyebOP/My-Userscripts/raw/refs/heads/main/EdgeCourseBD-Video-Extractor.user.js
 // @updateURL    https://github.com/ShoyebOP/My-Userscripts/raw/refs/heads/main/EdgeCourseBD-Video-Extractor.user.js
@@ -703,6 +703,19 @@
         return best;
     }
     function findActiveLessonEl() {
+        // First try to find lesson by header title (most reliable for current video)
+        try {
+            const hp = document.querySelector('div.flex.items-center.gap-3.border-b.bg-brand-0 p') || document.querySelector('p.min-w-0.text-sm.font-semibold');
+            if (hp && hp.textContent.trim()) {
+                const ht = hp.textContent.trim();
+                const cands = Array.from(document.querySelectorAll('div[role="region"] a, div[role="region"] button'));
+                for (const c of cands) {
+                    if (c.closest('h3')) continue;
+                    const txt = c.textContent.trim();
+                    if (txt === ht || txt.includes(ht) || ht.includes(txt)) return c;
+                }
+            }
+        } catch {}
         const lessonId = new URLSearchParams(location.search).get('lesson');
         if (lessonId) {
             const byHref = document.querySelector(`a[href*="lesson=${lessonId}"]`);
@@ -712,6 +725,7 @@
             // Sometimes lesson link is button with onclick containing lesson id
             const all = Array.from(document.querySelectorAll('a, button'));
             for (const el of all) {
+                if (el.closest('h3')) continue;
                 const outer = el.outerHTML || '';
                 if (outer.includes(lessonId) && el.textContent.trim().length < 120 && el.textContent.trim().length > 3) {
                     if (el.closest('div[role="region"], section')) return el;
@@ -762,7 +776,7 @@
             'p.min-w-0.text-sm.font-semibold',
             'div.overflow-hidden.rounded-xl p.font-semibold',
             'div.overflow-hidden p.text-sm',
-            'h1 + div p', // fallback near h1
+            'h1 + div p',
         ];
         for (const sel of titleSelectors) {
             try { headerP = document.querySelector(sel); if (headerP && headerP.textContent.trim().length > 3) break; } catch {}
@@ -773,19 +787,16 @@
             if (t.length > 3 && t.length < 200 && !/Course Progress|Course Outline|Course Content/i.test(t)) title = t;
         }
         if (!title) {
-            // Exhaustive search for any p/h containing অধ্যায়/Part near video
             const cands = Array.from(document.querySelectorAll('p, h1, h2, h3'));
             for (const p of cands) {
                 const txt = p.textContent.trim();
                 if (!txt || txt.length < 5 || txt.length > 150) continue;
                 if (/অধ্যায়|Part\s*–|Part\s*-|Lecture\s*\d|Chapter\s*\d/i.test(txt)) {
-                    if (p.offsetParent !== null) { // visible
-                        // Prefer those near video-container or with Bengali
+                    if (p.offsetParent !== null) {
                         if (p.closest('div.overflow-hidden.rounded-xl') || /অধ্যায়/.test(txt)) { title = txt; break; }
                     }
                 }
             }
-            // If still not, take first matching anywhere visible
             if (!title) {
                 for (const p of cands) {
                     const txt = p.textContent.trim();
@@ -798,14 +809,19 @@
             if (h1 && h1.textContent.trim()) {
                 const h1txt = h1.textContent.trim();
                 const lessonId = new URLSearchParams(location.search).get('lesson');
-                // Only use h1 if it's not the generic site title
                 if (!/EdgeCourse BD/i.test(h1txt) && h1txt.length < 80) {
                     title = h1txt;
-                    if (lessonId) title = `${h1txt} - Lesson ${lessonId}`;
+                    if (lessonId) {
+                        // Try to find more specific lesson title near video before using h1
+                        const more = Array.from(document.querySelectorAll('p, h2, h3')).find(p=>{
+                            const txt=p.textContent.trim();
+                            return /অধ্যায়|Part/.test(txt) && txt.length<120 && p.offsetParent!==null;
+                        });
+                        if (more) title = more.textContent.trim();
+                    }
                 }
             }
         }
-        // Last resort before document.title: try iframe title or video poster alt
         if (!title) {
             const iframe = document.querySelector('iframe[src*="vidinfra"], iframe[src*="player"]');
             if (iframe) {
@@ -813,16 +829,28 @@
                 if (it && it.trim() && !it.includes('http') && it.trim().length < 100) title = it.trim();
             }
         }
-
+        // If title from header, try to find corresponding lesson element in list to get full category path
+        let headerTitleForSearch = title;
         // Category path via active lesson hierarchy - captures ALL ancestors (Course Content > Academic Class > Subject)
         const activeEl = findActiveLessonEl();
         if (activeEl) {
             categoryPath = collectCategoryPath(activeEl);
             const lessonTxt = activeEl.textContent.trim().split('\n')[0].trim();
-            // If active lesson text is distinct from headerP, prefer it as title (leaf class name)
             if (lessonTxt && lessonTxt.length < 150 && lessonTxt.length > 3 && lessonTxt !== categoryPath[categoryPath.length-1]) {
-                // Only override if headerP title is generic or duplicate
                 if (!title || lessonTxt.length < title.length + 20) title = lessonTxt;
+            }
+            // If path is too short (only top level), try to augment via header title match
+            if (categoryPath.length <= 1 && title) {
+                try {
+                    const cands = Array.from(document.querySelectorAll('div[role="region"] a, div[role="region"] button'));
+                    for (const cand of cands) {
+                        const txt = cand.textContent.trim();
+                        if (txt === title || txt.includes(title) || title.includes(txt)) {
+                            const candPath = collectCategoryPath(cand);
+                            if (candPath.length > categoryPath.length) { categoryPath = candPath; console.log('[VidDB] activeEl path augmented via header title', title, '->', candPath); break; }
+                        }
+                    }
+                } catch {}
             }
         }
         // If no active lesson, try deepest open region's path (captures nested Academic Class > Subject)
@@ -833,12 +861,59 @@
                 const openRegion = document.querySelector('div[role="region"]:not([hidden])');
                 if (openRegion) categoryPath = collectCategoryPath(openRegion);
                 else {
-                    // Try any button[data-state="open"] headings - collects all open categories even if region not yet found
                     const openHeadings = Array.from(document.querySelectorAll('button[data-state="open"] p.line-clamp-2'))
                         .map(p => normalizeCategorySegment(p.textContent.trim())).filter(Boolean);
                     if (openHeadings.length) categoryPath = openHeadings;
                 }
             }
+        }
+        // If still short, try header title match as fallback (critical for physics case)
+        if ((!categoryPath.length || categoryPath.length === 1) && title) {
+            try {
+                const cands = Array.from(document.querySelectorAll('div[role="region"] a, div[role="region"] button, div[role="region"] [class*="flex"]'));
+                for (const cand of cands) {
+                    const txt = cand.textContent.trim();
+                    if (!txt || txt.length < 3 || txt.length > 150) continue;
+                    // Match header title to lesson row
+                    if (txt === title || (title.includes(txt) && txt.length > 5) || (txt.includes(title) && title.length > 5)) {
+                        if (cand.closest('h3')) continue; // skip headings
+                        const candPath = collectCategoryPath(cand);
+                        if (candPath.length > categoryPath.length) {
+                            categoryPath = candPath;
+                            console.log('[VidDB] headerTitle fallback path', title, '->', candPath);
+                            break;
+                        }
+                    }
+                }
+            } catch {}
+        }
+        // Fallback: try to find lesson element matching header title to get full path (header title is often the leaf class name) - always try to get longest path
+        if (title) {
+            const headerTitleForSearch = title;
+            try {
+                const allLessonCandidates = Array.from(document.querySelectorAll('div[role="region"] a, div[role="region"] button, div[role="region"] [role="button"]'));
+                for (const cand of allLessonCandidates) {
+                    if (cand.closest('h3')) continue; // skip category headings
+                    const txt = cand.textContent.trim();
+                    if (!txt || txt.length < 3 || txt.length > 150) continue;
+                    if (txt === headerTitleForSearch || txt.includes(headerTitleForSearch) || headerTitleForSearch.includes(txt)) {
+                        const candPath = collectCategoryPath(cand);
+                        if (candPath.length > categoryPath.length) { categoryPath = candPath; console.log('[VidDB] header title match fallback', headerTitleForSearch, '->', candPath); break; }
+                    }
+                }
+                // Also try any visible element with same text
+                if (categoryPath.length < 2) {
+                    const allP = Array.from(document.querySelectorAll('button, a'));
+                    for (const p of allP) {
+                        if (p.closest('h3')) continue;
+                        const txt = p.textContent.trim();
+                        if (txt === headerTitleForSearch && p.closest('div[role="region"]')) {
+                            const candPath = collectCategoryPath(p);
+                            if (candPath.length > categoryPath.length) { categoryPath = candPath; console.log('[VidDB] header title p match', headerTitleForSearch, '->', candPath); break; }
+                        }
+                    }
+                }
+            } catch {}
         }
         // Fallback: collect ALL currently open headings as path (ensures parent categories not missed)
         if (!categoryPath.length || categoryPath.length === 1) {
