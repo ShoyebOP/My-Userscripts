@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EdgeCourseBD Video Extractor & Manager (Categorized + Search + Sort)
 // @namespace    http://tampermonkey.net/
-// @version      3.4
-// @description  Extracts Vimeo / Tenbyte-Vidinfra (tb-player) links, categorizes them, with ultra-fast search and sorting. Dual player support + low-end optimized + iframe fix.
+// @version      4.0
+// @description  Extracts Vimeo / Tenbyte-Vidinfra (tb-player) links, auto-categorizes via new EdgeCourse layout (radix accordion + iframe + API hook), low-end optimized.
 // @author       ShoyebOP
 // @downloadURL  https://github.com/ShoyebOP/My-Userscripts/raw/refs/heads/main/EdgeCourseBD-Video-Extractor.user.js
 // @updateURL    https://github.com/ShoyebOP/My-Userscripts/raw/refs/heads/main/EdgeCourseBD-Video-Extractor.user.js
@@ -19,7 +19,7 @@
 
     const DB_KEY = 'edgeVids';
 
-    /* --- NETWORK HOOKS FOR NEW TB-PLAYER (Tenbyte / Vidinfra) --- */
+    /* --- NETWORK HOOKS --- */
     const capturedStreamUrls = [];
     function isStreamUrl(url) {
         if (!url || typeof url !== 'string') return false;
@@ -33,23 +33,94 @@
             console.log('[VidDB][StreamHook] Captured:', url);
         }
     }
+    // Bulk capture from course API (new site loads lessons via JSON)
+    const apiLessonCache = new Map(); // lessonId -> {title, category, link}
+    function handleCourseApiResponse(url, json) {
+        try {
+            let count = 0;
+            function walk(node, curCat) {
+                if (!node || typeof node !== 'object') return;
+                if (Array.isArray(node)) { node.forEach(n=>walk(n,curCat)); return; }
+                const title = node.title || node.name || node.lesson_title || node.lessonName || node.videoTitle || node.label;
+                const link = node.videoUrl || node.video_url || node.playerUrl || node.player_url || node.src || node.url || node.link || node.iframe || node.mediaUrl || node.video_url_hls;
+                // Detect chapter/category container
+                let newCat = curCat;
+                if (node.categoryName || node.chapterTitle || node.sectionTitle || node.groupName) {
+                    newCat = node.categoryName || node.chapterTitle || node.sectionTitle || node.groupName;
+                } else if (title && (node.lessons || node.videos || node.items || node.children || node.modules)) {
+                    newCat = title;
+                }
+                if (title && link && typeof link === 'string' && /vidinfra|tenbyte|vimeo|player|m3u8|mpd/i.test(link)) {
+                    // Heuristic: title should be lesson, not generic section, so check parent category exists
+                    const cat = newCat && newCat !== title ? newCat : (curCat || 'Uncategorized');
+                    const key = title.trim();
+                    if (!apiLessonCache.has(key)) {
+                        apiLessonCache.set(key, {title: key, category: cat, link});
+                        count++;
+                    }
+                    // Also try to save directly if we haven't yet
+                    const db = safeGetDB();
+                    let already = false;
+                    for (const v of Object.values(db)) if (v.title===key) {already=true;break;}
+                    if (!already) {
+                        // Don't auto-save all api lessons immediately to avoid spam, but queue for bulk save when user opens modal
+                        // Instead save if apiLessonCache size small? We'll save lazily in bulkCapture()
+                    }
+                }
+                for (const v of Object.values(node)) if (typeof v==='object') walk(v, newCat);
+            }
+            walk(json, null);
+            if (count) console.log(`[VidDB][API] Parsed ${count} lessons from ${url.slice(0,80)}`);
+        } catch(e) { console.warn('[VidDB] api walk err', e); }
+    }
     function installNetworkHooks() {
         try {
             const origFetch = window.fetch;
             if (origFetch) {
-                window.fetch = function(...args) {
+                window.fetch = async function(...args) {
                     try {
                         const first = args[0];
                         const url = (first instanceof Request) ? first.url : first;
                         if (typeof url === 'string') pushStreamUrl(url);
-                    } catch(e) {}
-                    return origFetch.apply(this, args);
+                    } catch {}
+                    const resp = await origFetch.apply(this, args);
+                    // Try to sniff course/lesson APIs
+                    try {
+                        const url = args[0] instanceof Request ? args[0].url : args[0];
+                        if (typeof url === 'string' && /mycourses|lesson|course|api\/v\d|vidinfra|tenbyte/i.test(url)) {
+                            const clone = resp.clone();
+                            const ct = clone.headers.get('content-type')||'';
+                            if (ct.includes('json') || url.includes('/api/') || url.includes('lesson')) {
+                                clone.text().then(t=>{
+                                    try {
+                                        const j = JSON.parse(t);
+                                        handleCourseApiResponse(url, j);
+                                    } catch {}
+                                    if (isStreamUrl(t)) pushStreamUrl(t);
+                                }).catch(()=>{});
+                            }
+                        }
+                    } catch {}
+                    return resp;
                 };
             }
             const origOpen = XMLHttpRequest.prototype.open;
+            const origSend = XMLHttpRequest.prototype.send;
+            let xhrUrlMap = new WeakMap();
             XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-                try { if (typeof url === 'string') pushStreamUrl(url); } catch(e) {}
+                try { if (typeof url === 'string') { pushStreamUrl(url); xhrUrlMap.set(this, url); } } catch {}
                 return origOpen.call(this, method, url, ...rest);
+            };
+            XMLHttpRequest.prototype.send = function(...args) {
+                this.addEventListener('load', function() {
+                    try {
+                        const url = xhrUrlMap.get(this) || this.responseURL || '';
+                        if (/mycourses|lesson|course|api\/v\d/i.test(url) && this.responseText) {
+                            try { const j = JSON.parse(this.responseText); handleCourseApiResponse(url, j); } catch {}
+                        }
+                    } catch {}
+                });
+                return origSend.apply(this, args);
             };
             try {
                 const mediaProto = HTMLMediaElement.prototype;
@@ -59,13 +130,13 @@
                     Object.defineProperty(mediaProto, 'src', {
                         get: srcDesc.get,
                         set: function(v) {
-                            try { if (typeof v === 'string') pushStreamUrl(v); } catch(e) {}
+                            try { if (typeof v === 'string') pushStreamUrl(v); } catch {}
                             return origSet.call(this, v);
                         },
                         configurable: true
                     });
                 }
-            } catch(e) {}
+            } catch {}
         } catch(e) {
             console.warn('[VidDB] Network hook install failed', e);
         }
@@ -74,145 +145,93 @@
         try {
             if (performance && performance.getEntriesByType) {
                 const resources = performance.getEntriesByType('resource');
-                for (const r of resources) {
-                    if (r.name && isStreamUrl(r.name)) pushStreamUrl(r.name);
-                }
+                for (const r of resources) if (r.name && isStreamUrl(r.name)) pushStreamUrl(r.name);
             }
-        } catch(e) {}
+        } catch {}
         try {
             document.querySelectorAll('source[src], video[src]').forEach(el => {
                 const u = el.src || el.getAttribute('src');
                 if (u) pushStreamUrl(u);
             });
-        } catch(e) {}
+        } catch {}
     }
     function findBestStreamForMedia(mediaId) {
         if (capturedStreamUrls.length === 0) return null;
-        if (mediaId) {
-            for (let i = capturedStreamUrls.length - 1; i >= 0; i--) {
-                if (capturedStreamUrls[i].includes(mediaId)) return capturedStreamUrls[i];
-            }
-        }
-        return capturedStreamUrls[capturedStreamUrls.length - 1];
+        if (mediaId) for (let i=capturedStreamUrls.length-1;i>=0;i--) if (capturedStreamUrls[i].includes(mediaId)) return capturedStreamUrls[i];
+        return capturedStreamUrls[capturedStreamUrls.length-1];
     }
     installNetworkHooks();
 
-    /* --- STORAGE HELPERS (fixes corruption, bloat, race) --- */
+    /* --- STORAGE --- */
     function safeGetDB() {
         try {
             let v = GM_getValue(DB_KEY, {});
-            // Tampermonkey may return string if previously stored as JSON
-            if (typeof v === 'string') {
-                try { v = JSON.parse(v); } catch { return {}; }
-            }
+            if (typeof v === 'string') try { v = JSON.parse(v); } catch { return {}; }
             if (!v || typeof v !== 'object' || Array.isArray(v)) return {};
             return v;
-        } catch (e) {
-            console.warn('[VidDB] safeGetDB failed', e);
-            return {};
-        }
+        } catch(e) { console.warn('[VidDB] safeGetDB failed', e); return {}; }
     }
     function safeSetDB(db) {
         try {
-            // Quick sanity: drop empty keys, fix missing savedAt
             for (const k of Object.keys(db)) {
                 if (!k || !k.trim()) { delete db[k]; continue; }
                 const e = db[k];
                 if (!e || typeof e !== 'object') { delete db[k]; continue; }
                 if (!e.savedAt) e.savedAt = Date.now();
                 if (!e.category) e.category = 'Uncategorized';
-                // purge stale blob links if we have better fallback
                 if (e.link && e.link.startsWith('blob:')) {
                     const better = e.streamUrl || e.poster || (e.mediaId ? `tenbyte://${e.mediaId}` : null);
                     if (better) e.link = better; else delete db[k];
                 }
             }
-            // Quota guard: GM storage ~2-10MB. Trim oldest 20% if >1.8MB serialized
             let serialized = JSON.stringify(db);
             if (serialized.length > 1800000) {
                 const entries = Object.entries(db).sort((a,b)=>(a[1].savedAt||0)-(b[1].savedAt||0));
                 const toRemove = Math.ceil(entries.length * 0.25);
                 for (let i=0;i<toRemove;i++) delete db[entries[i][0]];
-                console.warn(`[VidDB] Quota guard pruned ${toRemove} oldest entries`);
+                console.warn(`[VidDB] Quota guard pruned ${toRemove} oldest`);
                 serialized = JSON.stringify(db);
             }
             GM_setValue(DB_KEY, db);
             return true;
-        } catch (e) {
-            console.error('[VidDB] safeSetDB failed', e);
-            try { GM_setValue(DB_KEY, {}); } catch {}
-            return false;
-        }
+        } catch(e) { console.error('[VidDB] safeSetDB failed', e); try{GM_setValue(DB_KEY, {});}catch{} return false; }
     }
-    // One-time migration: normalize old blob entries, ensure title field, handle duplicate titles across categories
     function migrateDB() {
         const db = safeGetDB();
-        let changed = false;
-        const newDB = {};
-        for (const [rawKey, val] of Object.entries(db)) {
-            if (!rawKey || !rawKey.trim()) { changed = true; continue; }
-            if (!val || typeof val !== 'object') { changed = true; continue; }
-            // Ensure title field (old DB used key as title)
-            if (!val.title) val.title = rawKey;
-            // Trim
-            val.title = String(val.title).trim();
-            val.category = (val.category || 'Uncategorized').trim() || 'Uncategorized';
-            // Normalize category alias
-            if (val.category === 'Uncategorized / Extra') val.category = 'Uncategorized';
-            // Fix blob
+        let changed=false; const newDB={};
+        for (const [rawKey,val] of Object.entries(db)) {
+            if (!rawKey || !rawKey.trim()) {changed=true; continue;}
+            if (!val || typeof val!=='object') {changed=true; continue;}
+            if (!val.title) val.title=rawKey;
+            val.title=String(val.title).trim();
+            val.category=(val.category||'Uncategorized').trim()||'Uncategorized';
+            if (val.category==='Uncategorized / Extra') val.category='Uncategorized';
             if (val.link && val.link.startsWith('blob:')) {
-                const better = val.streamUrl || val.poster || (val.mediaId ? `tenbyte://${val.mediaId}` : null);
-                if (better) { val.link = better; changed = true; } else continue;
+                const better=val.streamUrl||val.poster||(val.mediaId?`tenbyte://${val.mediaId}`:null);
+                if (better){val.link=better;changed=true;} else continue;
             }
-            if (!val.link) { // incomplete entry
-                if (val.poster) val.link = val.poster;
-                else if (val.mediaId) val.link = `tenbyte://${val.mediaId}`;
-                else continue;
+            if (!val.link) { if (val.poster) val.link=val.poster; else if (val.mediaId) val.link=`tenbyte://${val.mediaId}`; else continue; }
+            if (!val.savedAt){val.savedAt=Date.now();changed=true;}
+            if (!val.page) val.page=location.href;
+            let newKey=rawKey;
+            const existing=newDB[newKey];
+            if (existing && (existing.category!==val.category || existing.mediaId!==val.mediaId)) {
+                newKey=`${val.category}::${val.title}`;
+                if (newDB[newKey] && val.mediaId) newKey=`${val.category}::${val.title}::${val.mediaId.slice(0,8)}`;
+                changed=true;
             }
-            if (!val.savedAt) { val.savedAt = Date.now(); changed = true; }
-            if (!val.page) val.page = location.href;
-            // Use stable key: prefer mediaId unique, else category::title to avoid collisions (same lecture name in two categories)
-            // Keep backward compat: if key already equals title and mediaId absent, keep as is if no collision yet
-            let newKey = rawKey;
-            if (val.mediaId) {
-                // If multiple entries share same mediaId, last wins - dedupe by mediaId is desired
-                // Keep title-based key for UI search but ensure mediaId unique: use mediaId as canonical if poster present
-                // To avoid breaking existing copy-by-name logic, keep title key but store mediaId for dedupe check below
-                // We'll detect duplicate titles with different categories and namespace them
-            }
-            // Detect collision: same title already in newDB but different category/mediaId
-            const existing = newDB[newKey];
-            if (existing && (existing.category !== val.category || existing.mediaId !== val.mediaId)) {
-                // Namespace with category to avoid overwrite
-                newKey = `${val.category}::${val.title}`;
-                // If still collides (duplicate within same category), append mediaId prefix
-                if (newDB[newKey] && val.mediaId) newKey = `${val.category}::${val.title}::${val.mediaId.slice(0,8)}`;
-                changed = true;
-            }
-            // Also dedupe by mediaId: if another entry already has same mediaId, keep newest savedAt
-            let dupByMedia = null;
-            if (val.mediaId) {
-                for (const [k,v] of Object.entries(newDB)) {
-                    if (v.mediaId && v.mediaId === val.mediaId) { dupByMedia = k; break; }
-                }
-            }
+            let dupByMedia=null;
+            if (val.mediaId) for (const [k,v] of Object.entries(newDB)) if (v.mediaId && v.mediaId===val.mediaId){dupByMedia=k;break;}
             if (dupByMedia) {
-                const keep = (newDB[dupByMedia].savedAt || 0) > (val.savedAt || 0) ? newDB[dupByMedia] : val;
-                newDB[dupByMedia] = keep;
-                changed = true;
-            } else {
-                newDB[newKey] = val;
-                if (newKey !== rawKey) changed = true;
-            }
+                const keep=(newDB[dupByMedia].savedAt||0)>(val.savedAt||0)?newDB[dupByMedia]:val;
+                newDB[dupByMedia]=keep; changed=true;
+            } else { newDB[newKey]=val; if (newKey!==rawKey) changed=true; }
         }
-        if (changed) {
-            console.log('[VidDB] Migration applied, before:', Object.keys(db).length, 'after:', Object.keys(newDB).length);
-            safeSetDB(newDB);
-        }
+        if (changed){ console.log('[VidDB] Migration',Object.keys(db).length,'->',Object.keys(newDB).length); safeSetDB(newDB); }
         return newDB;
     }
 
-    /* --- CSS FOR THE UI (low-end optimized) --- */
+    /* --- CSS --- */
     GM_addStyle(`
         #vid-collector-btn {
             position: fixed; bottom: 16px; left: 16px; z-index: 999999;
@@ -224,7 +243,6 @@
             transform: translateZ(0);
         }
         #vid-collector-btn:hover { background: #a6e3a1; color: #1e1e2e; }
-        
         #vid-collector-modal {
             display: none; position: fixed; inset: 8% auto auto 50%; transform: translateX(-50%) translateZ(0);
             width: min(880px, 90vw); max-height: 84vh;
@@ -238,67 +256,42 @@
             #vid-collector-btn { bottom: 12px; left: 12px; font-size: 12px; padding: 8px 10px; }
         }
         #vid-collector-modal h2 { margin: 0 0 10px 0; color: #89b4fa; border-bottom: 1px solid #313244; padding-bottom: 8px; flex-shrink: 0; font-size: 16px; }
-        
         .vid-top-bar { display: flex; gap: 8px; margin-bottom: 10px; flex-shrink: 0; }
-        .vid-input {
-            background: #1e1e2e; color: #cdd6f4; border: 1px solid #45475a;
-            padding: 7px 8px; border-radius: 6px; font-family: monospace; outline: none;
-        }
+        .vid-input { background: #1e1e2e; color: #cdd6f4; border: 1px solid #45475a; padding: 7px 8px; border-radius: 6px; font-family: monospace; outline: none; }
         .vid-input:focus { border-color: #89b4fa; }
         #vid-search { flex-grow: 1; min-width: 0; }
         #vid-sort { cursor: pointer; width: 190px; flex-shrink: 0; }
-        
         .vid-controls { margin-bottom: 8px; display: flex; gap: 6px; flex-shrink: 0; flex-wrap: wrap; }
-        .vid-btn { 
-            background: #313244; color: #cdd6f4; border: 1px solid #45475a; 
-            padding: 6px 10px; cursor: pointer; border-radius: 6px; font-family: monospace; font-size: 12px;
-        }
+        .vid-btn { background: #313244; color: #cdd6f4; border: 1px solid #45475a; padding: 6px 10px; cursor: pointer; border-radius: 6px; font-family: monospace; font-size: 12px; }
         .vid-btn:hover { background: #45475a; }
         .vid-btn.copy-btn { border-color: #a6e3a1; color: #a6e3a1; }
         .vid-btn.copy-btn:hover { background: #a6e3a1; color: #181825; }
         .vid-btn.danger-btn { border-color: #f38ba8; color: #f38ba8; }
-        
         #vid-list-container { flex-grow: 1; overflow-y: auto; padding-right: 4px; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; contain: content; }
-        
         .vid-category-group { margin-bottom: 8px; border: 1px solid #313244; border-radius: 6px; overflow: hidden; contain: layout paint; content-visibility: auto; contain-intrinsic-size: 0 60px; }
-        .vid-category-header { 
-            background: #1e1e2e; padding: 8px 10px; display: flex; align-items: center; gap: 8px; 
-            cursor: pointer; border-bottom: 1px solid transparent; user-select: none;
-        }
+        .vid-category-header { background: #1e1e2e; padding: 8px 10px; display: flex; align-items: center; gap: 8px; cursor: pointer; border-bottom: 1px solid transparent; user-select: none; }
         .vid-category-header:hover { background: #313244; }
         .vid-cat-toggle { font-size: 11px; color: #89b4fa; width: 14px; text-align: center; flex-shrink: 0; }
         .vid-cat-title { font-weight: 700; color: #f9e2af; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .vid-category-content { display: none; background: #181825; padding: 0; }
-        
         .vid-table { width: 100%; border-collapse: collapse; text-align: left; font-size: 12px; }
         .vid-table td { border-bottom: 1px solid #262637; padding: 6px 8px; word-break: break-word; }
         .vid-table tr:last-child td { border-bottom: none; }
         .vid-table tr:hover { background: #1e1e2e; }
-        
         .vid-checkbox { cursor: pointer; width: 14px; height: 14px; flex-shrink: 0; }
         .vid-close { position: absolute; top: 10px; right: 14px; cursor: pointer; font-size: 18px; color: #f38ba8; line-height: 1; }
-        
-        #vid-toast {
-            display: none; position: fixed; top: 16px; left: 50%; transform: translateX(-50%) translateZ(0);
-            background: #a6e3a1; color: #181825; padding: 8px 14px; border-radius: 6px;
-            z-index: 1000001; font-weight: 700; font-family: monospace; font-size: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.3);
-        }
-        
+        #vid-toast { display: none; position: fixed; top: 16px; left: 50%; transform: translateX(-50%) translateZ(0); background: #a6e3a1; color: #181825; padding: 8px 14px; border-radius: 6px; z-index: 1000001; font-weight: 700; font-family: monospace; font-size: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.3); }
         #vid-list-container::-webkit-scrollbar { width: 6px; }
         #vid-list-container::-webkit-scrollbar-track { background: #181825; }
         #vid-list-container::-webkit-scrollbar-thumb { background: #45475a; border-radius: 3px; }
-        @media (prefers-reduced-motion: reduce) {
-            *, *::before, *::after { transition: none !important; animation: none !important; }
-        }
+        @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; animation: none !important; } }
     `);
 
-    /* --- DOM ELEMENTS --- */
     let btn, modal, toast;
     function createUI() {
         btn = document.createElement('button');
         btn.id = 'vid-collector-btn';
         document.body.appendChild(btn);
-
         modal = document.createElement('div');
         modal.id = 'vid-collector-modal';
         modal.style.display = 'none';
@@ -320,7 +313,7 @@
                 <button class="vid-btn danger-btn" id="vid-clear-all" style="margin-left:auto;">Clear DB</button>
             </div>
             <div style="margin-bottom: 6px; display: flex; align-items: center; gap: 8px; flex-shrink: 0;">
-                <input type="checkbox" id="vid-master-checkbox" class="vid-checkbox"> 
+                <input type="checkbox" id="vid-master-checkbox" class="vid-checkbox">
                 <span style="color:#a6adc8; font-size: 12px;">Toggle visible</span>
                 <span id="vid-stats" style="margin-left:auto; color:#6c7086; font-size:11px;"></span>
             </div>
@@ -334,218 +327,265 @@
         updateBtnCounter();
     }
 
-    /* --- LOGIC --- */
-    let toastTimer = null;
-    function showToast(msg) {
+    let toastTimer=null;
+    function showToast(msg){
         if (!toast) return;
-        toast.textContent = msg;
-        toast.style.display = 'block';
-        clearTimeout(toastTimer);
-        toastTimer = setTimeout(() => { toast.style.display = 'none'; }, 2200);
+        toast.textContent=msg; toast.style.display='block';
+        clearTimeout(toastTimer); toastTimer=setTimeout(()=>toast.style.display='none',2200);
     }
-    function updateBtnCounter() {
+    function updateBtnCounter(){
         if (!btn) return;
-        const db = safeGetDB();
-        const c = Object.keys(db).length;
-        btn.textContent = `📼 Vids [${c}]`;
-        const stats = document.getElementById('vid-stats');
-        if (stats) stats.textContent = `${c} total`;
+        const db=safeGetDB(); const c=Object.keys(db).length;
+        btn.textContent=`📼 Vids [${c}]`;
+        const s=document.getElementById('vid-stats'); if(s) s.textContent=`${c} total`;
     }
-    function escapeHtml(s) {
-        return String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
-    }
-    function renderCategories() {
-        const db = safeGetDB();
-        const container = document.getElementById('vid-list-container');
-        const sortEl = document.getElementById('vid-sort');
-        const sortMethod = sortEl ? sortEl.value : 'date-asc';
+
+    function renderCategories(){
+        const db=safeGetDB();
+        const container=document.getElementById('vid-list-container');
+        const sortEl=document.getElementById('vid-sort');
+        const sortMethod=sortEl?sortEl.value:'date-asc';
         if (!container) return;
-        // Group
-        const grouped = {};
-        for (const [key, data] of Object.entries(db)) {
-            const title = (data.title || key || '').trim();
-            if (!title) continue;
-            const cat = (data.category || 'Uncategorized').trim() || 'Uncategorized';
-            if (!grouped[cat]) grouped[cat] = [];
-            grouped[cat].push([key, data]);
+        const grouped={};
+        for (const [key,data] of Object.entries(db)){
+            const title=(data.title||key||'').trim(); if(!title) continue;
+            const cat=(data.category||'Uncategorized').trim()||'Uncategorized';
+            if (!grouped[cat]) grouped[cat]=[];
+            grouped[cat].push([key,data]);
         }
-        // Sort categories alphabetically for stability
-        const cats = Object.keys(grouped).sort((a,b)=>a.localeCompare(b));
-        const frag = document.createDocumentFragment();
-        for (const catName of cats) {
-            const vids = grouped[catName];
+        const cats=Object.keys(grouped).sort((a,b)=>a.localeCompare(b));
+        const frag=document.createDocumentFragment();
+        for (const catName of cats){
+            const vids=grouped[catName];
             vids.sort((a,b)=>{
-                const da = a[1], db2 = b[1];
-                const ta = (da.title || a[0]), tb = (db2.title || b[0]);
-                if (sortMethod === 'name-asc') return ta.localeCompare(tb);
-                if (sortMethod === 'date-desc') return (db2.savedAt||0)-(da.savedAt||0);
+                const da=a[1], db2=b[1];
+                const ta=(da.title||a[0]), tb=(db2.title||b[0]);
+                if (sortMethod==='name-asc') return ta.localeCompare(tb);
+                if (sortMethod==='date-desc') return (db2.savedAt||0)-(da.savedAt||0);
                 return (da.savedAt||0)-(db2.savedAt||0);
             });
-            const groupDiv = document.createElement('div');
-            groupDiv.className = 'vid-category-group';
-            groupDiv.dataset.catName = catName.toLowerCase();
-            groupDiv.dataset.catRaw = catName;
-
-            const header = document.createElement('div');
-            header.className = 'vid-category-header';
-            // Use textContent for title to avoid HTML injection cost
-            const toggle = document.createElement('span');
-            toggle.className = 'vid-cat-toggle';
-            toggle.textContent = '▶';
-            const cb = document.createElement('input');
-            cb.type = 'checkbox';
-            cb.className = 'vid-checkbox cat-checkbox';
-            cb.dataset.category = catName;
-            const titleEl = document.createElement('span');
-            titleEl.className = 'vid-cat-title';
-            titleEl.textContent = `${catName} (${vids.length})`;
-            titleEl.title = catName;
-            header.append(toggle, cb, titleEl);
-
-            const content = document.createElement('div');
-            content.className = 'vid-category-content';
-            const table = document.createElement('table');
-            table.className = 'vid-table';
-            const tbody = document.createElement('tbody');
-            tbody.className = 'vid-tbody';
-            for (const [key, data] of vids) {
-                const title = data.title || key;
-                const tr = document.createElement('tr');
-                tr.dataset.vidName = title.toLowerCase();
-                tr.dataset.key = key;
-                const tdCb = document.createElement('td');
-                tdCb.style.cssText = 'width:28px; text-align:center;';
-                const rowCb = document.createElement('input');
-                rowCb.type = 'checkbox';
-                rowCb.className = 'vid-checkbox row-checkbox';
-                rowCb.dataset.key = key;
-                rowCb.dataset.name = title;
-                rowCb.dataset.category = catName;
+            const groupDiv=document.createElement('div');
+            groupDiv.className='vid-category-group';
+            groupDiv.dataset.catName=catName.toLowerCase();
+            groupDiv.dataset.catRaw=catName;
+            const header=document.createElement('div');
+            header.className='vid-category-header';
+            const toggle=document.createElement('span');
+            toggle.className='vid-cat-toggle'; toggle.textContent='▶';
+            const cb=document.createElement('input');
+            cb.type='checkbox'; cb.className='vid-checkbox cat-checkbox'; cb.dataset.category=catName;
+            const titleEl=document.createElement('span');
+            titleEl.className='vid-cat-title'; titleEl.textContent=`${catName} (${vids.length})`; titleEl.title=catName;
+            header.append(toggle,cb,titleEl);
+            const content=document.createElement('div');
+            content.className='vid-category-content';
+            const table=document.createElement('table'); table.className='vid-table';
+            const tbody=document.createElement('tbody'); tbody.className='vid-tbody';
+            for (const [key,data] of vids){
+                const title=data.title||key;
+                const tr=document.createElement('tr');
+                tr.dataset.vidName=title.toLowerCase(); tr.dataset.key=key;
+                const tdCb=document.createElement('td'); tdCb.style.cssText='width:28px; text-align:center;';
+                const rowCb=document.createElement('input'); rowCb.type='checkbox'; rowCb.className='vid-checkbox row-checkbox'; rowCb.dataset.key=key; rowCb.dataset.name=title; rowCb.dataset.category=catName;
                 tdCb.appendChild(rowCb);
-                const tdTitle = document.createElement('td');
-                tdTitle.textContent = title;
-                tdTitle.title = title;
-                const tdLink = document.createElement('td');
-                const displayLink = data.link || data.streamUrl || data.poster || '';
-                const a = document.createElement('a');
-                a.href = displayLink;
-                a.target = '_blank';
-                a.rel = 'noopener';
-                a.style.color = '#89b4fa';
-                a.textContent = displayLink ? displayLink.split('?')[0].slice(0,40) + (displayLink.length>40?'…':'') : 'no-link';
-                a.title = [displayLink, data.mediaId?`id:${data.mediaId}`:'', data.poster?`poster:${data.poster}`:''].filter(Boolean).join('\n');
+                const tdTitle=document.createElement('td'); tdTitle.textContent=title; tdTitle.title=title;
+                const tdLink=document.createElement('td');
+                const displayLink=data.link||data.streamUrl||data.poster||'';
+                const a=document.createElement('a'); a.href=displayLink; a.target='_blank'; a.rel='noopener'; a.style.color='#89b4fa';
+                a.textContent=displayLink?displayLink.split('?')[0].slice(0,40)+(displayLink.length>40?'…':''):'no-link';
+                a.title=[displayLink, data.mediaId?`id:${data.mediaId}`:'', data.poster?`poster:${data.poster}`:''].filter(Boolean).join('\n');
                 tdLink.appendChild(a);
-                if (data.mediaId) {
-                    const badge = document.createElement('span');
-                    badge.textContent = `[${data.mediaId.slice(0,8)}]`;
-                    badge.style.cssText = 'color:#6c7086; font-size:10px; margin-left:6px;';
-                    tdLink.appendChild(badge);
-                }
-                tr.append(tdCb, tdTitle, tdLink);
-                tbody.appendChild(tr);
+                if (data.mediaId){ const badge=document.createElement('span'); badge.textContent=`[${data.mediaId.slice(0,8)}]`; badge.style.cssText='color:#6c7086; font-size:10px; margin-left:6px;'; tdLink.appendChild(badge); }
+                tr.append(tdCb,tdTitle,tdLink); tbody.appendChild(tr);
             }
-            table.appendChild(tbody);
-            content.appendChild(table);
-            groupDiv.append(header, content);
-            frag.appendChild(groupDiv);
+            table.appendChild(tbody); content.appendChild(table);
+            groupDiv.append(header,content); frag.appendChild(groupDiv);
         }
         container.replaceChildren(frag);
         triggerSearch();
     }
 
-    function triggerSearch() {
-        const termEl = document.getElementById('vid-search');
-        if (!termEl) return;
-        const term = termEl.value.trim().toLowerCase();
-        const groups = document.querySelectorAll('.vid-category-group');
-        groups.forEach(group => {
-            const catName = group.dataset.catName || '';
-            const catRaw = group.dataset.catRaw || catName;
-            const rows = group.querySelectorAll('tbody tr');
-            let visible = 0;
-            const catMatch = term && catName.includes(term);
-            rows.forEach(row => {
-                const name = row.dataset.vidName || '';
-                const show = !term || catMatch || name.includes(term);
-                row.style.display = show ? '' : 'none';
-                if (show) visible++;
+    function triggerSearch(){
+        const termEl=document.getElementById('vid-search'); if(!termEl) return;
+        const term=termEl.value.trim().toLowerCase();
+        const groups=document.querySelectorAll('.vid-category-group');
+        groups.forEach(group=>{
+            const catName=group.dataset.catName||'';
+            const rows=group.querySelectorAll('tbody tr');
+            let visible=0;
+            const catMatch=term && catName.includes(term);
+            rows.forEach(row=>{
+                const name=row.dataset.vidName||'';
+                const show=!term || catMatch || name.includes(term);
+                row.style.display=show?'':'none'; if(show) visible++;
             });
-            const hasVisible = visible > 0;
-            group.style.display = !term || hasVisible ? '' : 'none';
-            if (hasVisible) {
-                const content = group.querySelector('.vid-category-content');
-                const toggle = group.querySelector('.vid-cat-toggle');
-                if (!content || !toggle) return;
-                const shouldOpen = term !== '' && visible>0;
-                // keep user toggled state if no search term
-                if (term !== '') {
-                    content.style.display = shouldOpen ? 'block' : 'none';
-                    toggle.textContent = shouldOpen ? '▼' : '▶';
-                }
+            const hasVisible=visible>0;
+            group.style.display=!term || hasVisible?'':'none';
+            if (hasVisible){
+                const content=group.querySelector('.vid-category-content');
+                const toggle=group.querySelector('.vid-cat-toggle');
+                if (!content||!toggle) return;
+                const shouldOpen=term!=='' && visible>0;
+                if (term!==''){ content.style.display=shouldOpen?'block':'none'; toggle.textContent=shouldOpen?'▼':'▶'; }
             }
         });
     }
 
-    function getSelectedCourseInfo() {
-        // Try multiple selectors for selected lecture - site changed class from bg-brand-100 in newer builds
-        let selectedContainer = document.querySelector('div.bg-brand-100');
-        if (!selectedContainer) selectedContainer = document.querySelector('[class*="bg-brand-"][class*="100"]');
-        if (!selectedContainer) {
-            // Fallback: look for any element with aria-current or active class near course_tab_text
-            const candidates = Array.from(document.querySelectorAll('[aria-current="true"], [class*="active"], [class*="selected"]'));
-            for (const c of candidates) {
-                if (c.querySelector('span.course_tab_text') || c.querySelector('.course_tab_text')) { selectedContainer = c; break; }
-            }
+    // --- NEW SITE TITLE/CATEGORY EXTRACTION ---
+    function getNewSiteTitleAndCategory() {
+        // Title: the header directly below player (অধ্যায়-০১...) is most reliable for current video
+        let title = null;
+        let category = 'Uncategorized';
+
+        // 1) New site: header below video player (the <p> with min-w-0)
+        const headerP = document.querySelector('div.flex.items-center.gap-3.border-b.bg-brand-0 p');
+        if (headerP && headerP.textContent.trim()) {
+            const t = headerP.textContent.trim();
+            // Filter out generic "Course Outline" etc? Keep if it looks like a lecture title
+            if (t.length > 3 && t.length < 200) title = t;
         }
-        if (!selectedContainer) {
-            // Last resort: first visible course_tab_text that looks like a lecture title (heuristic)
-            const all = Array.from(document.querySelectorAll('span.course_tab_text'));
-            // Prefer the one that is currently highlighted via background or border
-            for (const el of all) {
-                const parent = el.closest('div, button, a');
-                if (parent && getComputedStyle(parent).backgroundColor !== 'rgba(0, 0, 0, 0)') {
-                    // heuristic, but we just pick first if nothing else
+        // Fallback: any p with অধ্যায় or Part near player
+        if (!title) {
+            const candidates = Array.from(document.querySelectorAll('p.min-w-0.text-sm, p.line-clamp-2'));
+            for (const p of candidates) {
+                const txt = p.textContent.trim();
+                if (/অধ্যায়|Part|Lecture|Class|Chapter/i.test(txt) && txt.length < 120 && txt.length > 5) {
+                    // Prefer the one closest to video-container
+                    title = txt; break;
                 }
             }
         }
-        let title = null;
-        let category = 'Uncategorized';
+        // Fallback to h1 course name + lesson id
+        if (!title) {
+            const h1 = document.querySelector('h1');
+            const lessonId = new URLSearchParams(location.search).get('lesson');
+            if (lessonId && h1) title = `${h1.textContent.trim()} - Lesson ${lessonId}`;
+            else if (h1 && h1.textContent.trim().length < 80) title = h1.textContent.trim();
+        }
+
+        // 2) Category: find open accordion category heading
+        // Try to locate active lesson element first, then derive category
+        const lessonId = new URLSearchParams(location.search).get('lesson');
+        let activeLessonEl = null;
+        if (lessonId) {
+            activeLessonEl = document.querySelector(`a[href*="lesson=${lessonId}"]`) || document.querySelector(`[data-lesson="${lessonId}"]`);
+        }
+        if (!activeLessonEl) {
+            // Look for element with bg-brand-500 text-white inside Course Content (active lesson)
+            const contentSection = document.querySelector('section#section_course\\ content') || document.querySelector('section');
+            if (contentSection) {
+                // Active lesson likely has bg-brand-500 or bg-brand-0 with ring
+                activeLessonEl = contentSection.querySelector('[class*="bg-brand-500"]');
+                if (activeLessonEl && activeLessonEl.textContent.trim().length > 100) activeLessonEl = null; // ignore section header
+            }
+        }
+        if (!activeLessonEl) activeLessonEl = document.querySelector('[aria-current="true"]');
+
+        // If we found active lesson, title from it beats headerP
+        if (activeLessonEl) {
+            const lessonTxt = activeLessonEl.textContent.trim().split('\n')[0].trim();
+            if (lessonTxt && lessonTxt.length < 150) title = lessonTxt;
+            // Find its category (nearest region's heading)
+            const region = activeLessonEl.closest('div[role="region"]');
+            if (region) {
+                const headingBtn = region.previousElementSibling;
+                if (headingBtn) {
+                    const p = headingBtn.querySelector('p.line-clamp-2') || headingBtn.querySelector('p');
+                    if (p && p.textContent.trim()) category = p.textContent.trim();
+                }
+            }
+            if (category === 'Uncategorized') {
+                const catBtn = activeLessonEl.closest('div[data-orientation="vertical"]')?.querySelector('button p.line-clamp-2');
+                if (catBtn) category = catBtn.textContent.trim();
+            }
+        }
+
+        // If no active lesson, try open region's heading as category
+        if (category === 'Uncategorized') {
+            const openRegion = document.querySelector('div[role="region"]:not([hidden])');
+            if (openRegion) {
+                const btn = openRegion.previousElementSibling;
+                if (btn) {
+                    const p = btn.querySelector('p.line-clamp-2');
+                    if (p && p.textContent.trim()) category = p.textContent.trim();
+                    else if (btn.textContent.trim()) category = btn.textContent.trim().split('\n')[0].trim();
+                }
+                // Section h2 fallback
+                const sec = openRegion.closest('section');
+                if (category === 'Uncategorized' && sec) {
+                    const h2 = sec.querySelector('h2');
+                    if (h2) category = h2.textContent.trim();
+                }
+            }
+        }
+        // Final fallback: section heading
+        if (category === 'Uncategorized') {
+            const secH2 = document.querySelector('section#section_course\\ content h2') || document.querySelector('section h2');
+            if (secH2 && secH2.textContent.trim()) category = secH2.textContent.trim();
+            else {
+                // Use h1 course name as category if nothing else
+                const h1 = document.querySelector('h1');
+                if (h1 && h1.textContent.trim()) category = h1.textContent.trim().slice(0,40);
+            }
+        }
+
+        // Sanitize
+        if (title) title = title.replace(/\s+/g, ' ').trim();
+        if (category) category = category.replace(/\s+/g, ' ').trim();
+        if (category.length > 80) category = category.slice(0,80);
+
+        return {title, category, activeLessonEl};
+    }
+
+    function getSelectedCourseInfoLegacy() {
+        let selectedContainer = document.querySelector('div.bg-brand-100');
+        if (!selectedContainer) selectedContainer = document.querySelector('[class*="bg-brand-"][class*="100"]');
+        if (!selectedContainer) {
+            const candidates = Array.from(document.querySelectorAll('[aria-current="true"], [class*="active"], [class*="selected"]'));
+            for (const c of candidates) if (c.querySelector('span.course_tab_text') || c.querySelector('.course_tab_text')) { selectedContainer=c; break; }
+        }
+        let title=null, category='Uncategorized';
         if (selectedContainer) {
             const titleEl = selectedContainer.querySelector('span.course_tab_text') || selectedContainer.querySelector('.course_tab_text') || selectedContainer;
             if (titleEl) {
                 const t = titleEl.textContent ? titleEl.textContent.trim() : '';
-                if (t) title = t;
-                else if (selectedContainer.textContent) title = selectedContainer.textContent.trim().split('\n')[0].trim();
+                if (t) title=t; else if (selectedContainer.textContent) title=selectedContainer.textContent.trim().split('\n')[0].trim();
             }
             const regionDiv = selectedContainer.closest('div[role="region"]');
             if (regionDiv && regionDiv.parentElement) {
                 const catTitleEl = regionDiv.parentElement.querySelector('h3 .course_tab_text') || regionDiv.parentElement.querySelector('h3');
                 if (catTitleEl) {
-                    const cat = catTitleEl.textContent.trim();
-                    if (cat) category = cat;
+                    const cat=catTitleEl.textContent.trim();
+                    if (cat) category=cat;
                 }
             }
-            // Fallback category search upwards
-            if (category === 'Uncategorized') {
-                let p = selectedContainer.parentElement;
-                for (let i=0; i<4 && p; i++, p=p.parentElement) {
-                    const h3 = p.querySelector('h3 .course_tab_text');
-                    if (h3 && h3.textContent.trim()) { category = h3.textContent.trim(); break; }
-                    const h3b = p.querySelector('h3');
-                    if (h3b && h3b.textContent.trim().length < 80) { category = h3b.textContent.trim(); break; }
+            if (category==='Uncategorized') {
+                let p=selectedContainer.parentElement;
+                for(let i=0;i<4&&p;i++,p=p.parentElement){
+                    const h3=p.querySelector('h3 .course_tab_text');
+                    if (h3 && h3.textContent.trim()){category=h3.textContent.trim();break;}
+                    const h3b=p.querySelector('h3');
+                    if (h3b && h3b.textContent.trim().length<80){category=h3b.textContent.trim();break;}
                 }
             }
         }
-        // If still no title, try data-media-title from video/iframe as last resort (will be used by saveEntry fallback)
         if (!title) {
-            const v = document.querySelector('video[data-media-title]');
-            if (v) {
-                const mt = v.getAttribute('data-media-title');
-                if (mt && mt.trim()) title = mt.trim();
-            }
+            const v=document.querySelector('video[data-media-title]');
+            if (v){ const mt=v.getAttribute('data-media-title'); if(mt&&mt.trim()) title=mt.trim(); }
         }
-        return { title, category, selectedContainer };
+        return {title, category, selectedContainer};
     }
+
+    function getSelectedCourseInfo() {
+        // Try new site first, then legacy
+        const newer = getNewSiteTitleAndCategory();
+        if (newer.title && newer.title.length > 4) return {title: newer.title, category: newer.category, selectedContainer: newer.activeLessonEl};
+        const legacy = getSelectedCourseInfoLegacy();
+        if (legacy.title) return legacy;
+        // Ultimate fallback
+        return newer.title ? {title: newer.title, category: newer.category} : legacy;
+    }
+
     function getMediaIdFromPoster(poster) {
         if (!poster) return null;
         const m = poster.match(/\/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\//i);
@@ -555,51 +595,41 @@
     let lastSavedSig = '';
     let scanThrottle = null;
     let tickCounter = 0;
-    function scheduleScan() {
-        if (scanThrottle) return;
-        scanThrottle = setTimeout(()=>{ scanThrottle=null; scanForVideo(); }, 500);
-    }
+    function scheduleScan(){ if(scanThrottle) return; scanThrottle=setTimeout(()=>{scanThrottle=null; scanForVideo();}, 450); }
+
     function scanForVideo() {
-        if (document.hidden) return; // offload when tab hidden
-        const { title: selTitle, category: selCategory } = getSelectedCourseInfo();
+        if (document.hidden) return;
+        const {title: selTitle, category: selCategory} = getSelectedCourseInfo();
         const db = safeGetDB();
         let dirty = false;
 
-        // Debug tick - helps user diagnose why not capturing
         tickCounter++;
-        if (tickCounter % 15 === 1) {
+        if (tickCounter % 12 === 1) {
             try {
                 const vid = document.querySelector('video.tb-player__video, video[data-media-id], .tb-player__video-container video');
-                const iframes = Array.from(document.querySelectorAll('iframe')).map(f=> (f.src||f.getAttribute('src')||'').slice(0,90));
-                console.log(`[VidDB] tick #${tickCounter} selTitle=${selTitle||'-'} selCat=${selCategory} video=${!!vid} iframes=${iframes.length}`, iframes);
+                const iframes = Array.from(document.querySelectorAll('iframe')).map(f=>(f.src||f.getAttribute('src')||'').slice(0,85));
+                const headerP = document.querySelector('div.flex.items-center.gap-3.border-b.bg-brand-0 p');
+                console.log(`[VidDB] tick #${tickCounter} selTitle=${selTitle||'-'} cat=${selCategory} headerP=${headerP?.textContent?.trim().slice(0,40)||'-'} video=${!!vid} ifr=${iframes.length}`, iframes);
             } catch {}
         }
 
-        function saveEntry(title, link, category, extra) {
+        function saveEntry(title, link, category, extra){
             if (!title || !title.trim() || !link || link.startsWith('blob:')) return false;
-            title = title.trim();
-            category = (category || 'Uncategorized').trim() || 'Uncategorized';
-            if (category === 'Uncategorized / Extra') category = 'Uncategorized';
-            let key = title;
-            const mediaId = extra.mediaId || null;
-            if (mediaId) {
-                let foundKey = null;
-                for (const [k,v] of Object.entries(db)) if (v.mediaId === mediaId) { foundKey = k; break; }
-                if (foundKey) key = foundKey;
-                else if (db[title] && db[title].mediaId && db[title].mediaId !== mediaId) {
-                    key = `${category}::${title}`;
-                    if (db[key] && db[key].mediaId !== mediaId) key = `${category}::${title}::${mediaId.slice(0,8)}`;
-                }
-            } else if (db[title] && db[title].category !== category) {
-                key = `${category}::${title}`;
-            }
-            const cur = db[key];
-            const sig = `${link}|${category}|${mediaId||''}|${extra.poster||''}|${extra.streamUrl||''}`;
-            if (!cur || cur.link !== link || cur.category !== category || cur.mediaId !== mediaId || cur.poster !== extra.poster || cur.streamUrl !== extra.streamUrl) {
-                if (sig !== lastSavedSig) {
-                    db[key] = { title, link, category, page: location.href, savedAt: cur?.savedAt || Date.now(), mediaId: mediaId || cur?.mediaId, poster: extra.poster || cur?.poster, streamUrl: extra.streamUrl || undefined, rawSrc: extra.rawSrc || undefined };
-                    lastSavedSig = sig;
-                    dirty = true;
+            title = title.trim(); category=(category||'Uncategorized').trim()||'Uncategorized';
+            if (category==='Uncategorized / Extra') category='Uncategorized';
+            let key=title;
+            const mediaId=extra.mediaId||null;
+            if (mediaId){
+                let found=null; for(const [k,v] of Object.entries(db)) if(v.mediaId===mediaId){found=k;break;}
+                if(found) key=found;
+                else if(db[title] && db[title].mediaId && db[title].mediaId!==mediaId){ key=`${category}::${title}`; if(db[key] && db[key].mediaId!==mediaId) key=`${category}::${title}::${mediaId.slice(0,8)}`; }
+            } else if(db[title] && db[title].category!==category){ key=`${category}::${title}`; }
+            const cur=db[key];
+            const sig=`${link}|${category}|${mediaId||''}|${extra.poster||''}|${extra.streamUrl||''}`;
+            if (!cur || cur.link!==link || cur.category!==category || cur.mediaId!==mediaId || cur.poster!==extra.poster || cur.streamUrl!==extra.streamUrl){
+                if (sig!==lastSavedSig){
+                    db[key]={title, link, category, page: location.href, savedAt: cur?.savedAt||Date.now(), mediaId: mediaId||cur?.mediaId, poster: extra.poster||cur?.poster, streamUrl: extra.streamUrl||undefined, rawSrc: extra.rawSrc||undefined};
+                    lastSavedSig=sig; dirty=true;
                     console.log(`[VidDB][${extra.via||'save'}] [${category}] ${title} id=${mediaId||'-'} link=${link.slice(0,70)}`);
                     return true;
                 }
@@ -607,244 +637,205 @@
             return false;
         }
 
-        // 1) IFRAME players - PRIMARY (cross-origin tb-player is inside iframe, outer page cannot see <video>)
-        // Covers old Vimeo + new Vidinfra/Tenbyte. This was the root cause of "not capturing" - previous version only checked video element on outer page.
+        // 1) IFRAME players (PRIMARY) - vidinfra / vimeo
         try {
             const allIframes = Array.from(document.querySelectorAll('iframe'));
-            const candidates = allIframes.filter(f => {
-                const s = (f.src || f.getAttribute('src') || '').toLowerCase();
-                if (!s || s.startsWith('blob:')) return false;
+            const candidates = allIframes.filter(f=>{
+                const s=(f.src||f.getAttribute('src')||'').toLowerCase();
+                if(!s || s.startsWith('blob:')) return false;
                 return /player\.vimeo\.com|vidinfra|tenbyte|tenbytecdn|player\./i.test(s) || s.includes('player');
             });
-            // Fallback: if no candidate but there is exactly one iframe (likely the player), use it
-            const iframePool = candidates.length ? candidates : (allIframes.length === 1 ? allIframes : []);
-
-            for (const iframe of iframePool) {
-                const link = iframe.src || iframe.getAttribute('src') || '';
-                if (!link || link.startsWith('blob:')) continue;
-                // Title: sidebar is primary, then iframe attrs, then document.title fallback (don't skip if sidebar missing - previous version returned early)
+            const iframePool = candidates.length ? candidates : (allIframes.length===1 ? allIframes : []);
+            for (const iframe of iframePool){
+                const link=iframe.src||iframe.getAttribute('src')||'';
+                if(!link || link.startsWith('blob:')) continue;
                 let title = selTitle && selTitle.trim() ? selTitle.trim() : null;
-                if (!title) title = (iframe.getAttribute('title') || iframe.getAttribute('data-media-title') || '').trim() || null;
-                if (!title) {
-                    // Try to peek inside iframe if same-origin (will throw if cross-origin, that's fine)
-                    try {
-                        const idoc = iframe.contentDocument;
-                        if (idoc) {
-                            const v = idoc.querySelector('video[data-media-title], video.tb-player__video');
-                            const mt = v && (v.getAttribute('data-media-title') || v.dataset.mediaTitle);
-                            if (mt && mt.trim()) title = mt.trim();
-                            if (!title) {
-                                const poster = v && (v.getAttribute('poster')||v.poster);
-                                const mid = poster && getMediaIdFromPoster(poster);
-                                if (mid) title = `Tenbyte-${mid}`;
-                            }
+                if (!title) title=(iframe.getAttribute('title')||iframe.getAttribute('data-media-title')||'').trim()||null;
+                if (!title){
+                    try{
+                        const idoc=iframe.contentDocument;
+                        if(idoc){
+                            const v=idoc.querySelector('video[data-media-title], video.tb-player__video');
+                            const mt=v && (v.getAttribute('data-media-title')||v.dataset.mediaTitle);
+                            if(mt&&mt.trim()) title=mt.trim();
+                            if(!title){ const poster=v && (v.getAttribute('poster')||v.poster); const mid=poster && getMediaIdFromPoster(poster); if(mid) title=`Tenbyte-${mid}`; }
                         }
-                    } catch {}
+                    }catch{}
                 }
-                if (!title) title = document.title ? document.title.trim().slice(0,120) : null;
+                if (!title) title=document.title?document.title.trim().slice(0,120):null;
                 if (!title) continue;
-
-                let mediaId = getMediaIdFromPoster(link) || (link.match(/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/i)?.[1] || null);
-                let poster = null;
-                let extraMediaTitle = null;
-                try {
-                    const idoc = iframe.contentDocument;
-                    if (idoc) {
-                        const v = idoc.querySelector('video.tb-player__video, video[data-media-id], video[poster]');
-                        if (v) {
-                            poster = v.getAttribute('poster') || v.poster || null;
-                            const mid2 = v.getAttribute('data-media-id') || v.dataset.mediaId;
-                            if (mid2) mediaId = mid2;
-                            else if (poster && !mediaId) mediaId = getMediaIdFromPoster(poster);
-                            const mt2 = v.getAttribute('data-media-title') || v.dataset.mediaTitle;
-                            if (mt2 && mt2.trim()) { extraMediaTitle = mt2.trim(); title = mt2.trim(); }
+                let mediaId=getMediaIdFromPoster(link) || (link.match(/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/i)?.[1]||null);
+                let poster=null, extraMediaTitle=null;
+                try{
+                    const idoc=iframe.contentDocument;
+                    if(idoc){
+                        const v=idoc.querySelector('video.tb-player__video, video[data-media-id], video[poster]');
+                        if(v){
+                            poster=v.getAttribute('poster')||v.poster||null;
+                            const mid2=v.getAttribute('data-media-id')||v.dataset.mediaId;
+                            if(mid2) mediaId=mid2; else if(poster && !mediaId) mediaId=getMediaIdFromPoster(poster);
+                            const mt2=v.getAttribute('data-media-title')||v.dataset.mediaTitle;
+                            if(mt2&&mt2.trim()){extraMediaTitle=mt2.trim(); title=mt2.trim();}
                         }
                     }
-                } catch {}
-                // If still no mediaId, try to find tb-player video on outer page (some embeds are not iframe)
-                if (!mediaId && !poster) {
-                    const outerVideo = document.querySelector('video.tb-player__video[poster], video[data-media-id]');
-                    if (outerVideo) {
-                        poster = outerVideo.getAttribute('poster') || outerVideo.poster || null;
-                        mediaId = outerVideo.getAttribute('data-media-id') || outerVideo.dataset.mediaId || getMediaIdFromPoster(poster);
-                        const mt3 = outerVideo.getAttribute('data-media-title') || outerVideo.dataset.mediaTitle;
-                        if (mt3 && mt3.trim()) title = mt3.trim();
+                }catch{}
+                if (!mediaId && !poster){
+                    const outerVideo=document.querySelector('video.tb-player__video[poster], video[data-media-id]');
+                    if(outerVideo){
+                        poster=outerVideo.getAttribute('poster')||outerVideo.poster||null;
+                        mediaId=outerVideo.getAttribute('data-media-id')||outerVideo.dataset.mediaId||getMediaIdFromPoster(poster);
+                        const mt3=outerVideo.getAttribute('data-media-title')||outerVideo.dataset.mediaTitle;
+                        if(mt3&&mt3.trim()) title=mt3.trim();
                     }
                 }
-                if (extraMediaTitle) title = extraMediaTitle;
+                if(extraMediaTitle) title=extraMediaTitle;
                 scanPerformanceForStream();
-                const streamUrl = findBestStreamForMedia(mediaId);
-                const finalLink = streamUrl || link;
-                const category = selCategory || 'Uncategorized';
-                saveEntry(title, finalLink, category, { mediaId, poster, streamUrl, rawSrc: link, via: streamUrl ? 'iframe+stream' : 'iframe' });
+                const streamUrl=findBestStreamForMedia(mediaId);
+                const finalLink=streamUrl||link;
+                const category=selCategory||'Uncategorized';
+                saveEntry(title, finalLink, category, {mediaId, poster, streamUrl, rawSrc: link, via: streamUrl?'iframe+stream':'iframe'});
             }
-        } catch(e) { console.warn('[VidDB] iframe err', e); }
+        } catch(e){ console.warn('[VidDB] iframe err',e); }
 
-        // 2) Direct video element on outer page (same-origin fallback, no iframe)
-        try {
+        // 2) Direct video element (same-origin fallback)
+        try{
             scanPerformanceForStream();
-            const video = document.querySelector('video.tb-player__video, video[data-media-id], .tb-player__video-container video, video[data-media-title], video[poster*="tenbytecdn.com"]');
-            // Only handle if not already handled via iframe and video is not inside an iframe element (outer page)
-            const isInsideIframeEl = video && video.closest && !!video.closest('iframe');
-            if (video && !isInsideIframeEl) {
-                let mediaId = video.getAttribute('data-media-id') || video.dataset.mediaId || null;
-                let mediaTitle = video.getAttribute('data-media-title') || video.dataset.mediaTitle || null;
-                if (mediaTitle && !mediaTitle.trim()) mediaTitle = null;
-                let poster = video.getAttribute('poster') || video.poster || null;
-                if (!poster) {
-                    const alt = document.querySelector('.tb-player__video[poster], video[poster]');
-                    if (alt) poster = alt.getAttribute('poster') || alt.poster;
-                }
-                if (!mediaId && poster) mediaId = getMediaIdFromPoster(poster);
-                let sourceEl = video.querySelector('source');
-                let rawSrc = video.currentSrc || video.src || (sourceEl && (sourceEl.src || sourceEl.getAttribute('src'))) || null;
-                if (rawSrc && rawSrc.startsWith('blob:')) rawSrc = null;
-                if (rawSrc) pushStreamUrl(rawSrc);
-                let streamUrl = findBestStreamForMedia(mediaId);
-                if (!streamUrl && rawSrc && isStreamUrl(rawSrc)) streamUrl = rawSrc;
-                let title = null;
-                if (mediaTitle && mediaTitle.trim()) title = mediaTitle.trim();
-                else if (selTitle && selTitle.trim()) title = selTitle.trim();
-                else if (poster) title = `Tenbyte-${mediaId || 'video'}`;
-                if (title) {
-                    title = title.trim();
-                    let link = streamUrl || rawSrc || poster || (mediaId ? `tenbyte://${mediaId}` : null);
-                    if (link && !link.startsWith('blob:')) {
-                        let category = selCategory || 'Uncategorized';
-                        if (category === 'Uncategorized' && !document.querySelector('div.bg-brand-100')) {
-                            const catEl = document.querySelector('h3 .course_tab_text');
-                            if (catEl && catEl.textContent.trim()) category = catEl.textContent.trim();
-                        }
-                        // Use saveEntry helper for dedup logic
-                        saveEntry(title, link, category, { mediaId, poster, streamUrl, rawSrc, via: streamUrl ? 'video+stream' : 'video' });
+            const video=document.querySelector('video.tb-player__video, video[data-media-id], .tb-player__video-container video, video[data-media-title], video[poster*="tenbytecdn.com"]');
+            const isInsideIframeEl=video && video.closest && !!video.closest('iframe');
+            if(video && !isInsideIframeEl){
+                let mediaId=video.getAttribute('data-media-id')||video.dataset.mediaId||null;
+                let mediaTitle=video.getAttribute('data-media-title')||video.dataset.mediaTitle||null;
+                if(mediaTitle && !mediaTitle.trim()) mediaTitle=null;
+                let poster=video.getAttribute('poster')||video.poster||null;
+                if(!poster){ const alt=document.querySelector('.tb-player__video[poster], video[poster]'); if(alt) poster=alt.getAttribute('poster')||alt.poster; }
+                if(!mediaId && poster) mediaId=getMediaIdFromPoster(poster);
+                let sourceEl=video.querySelector('source');
+                let rawSrc=video.currentSrc||video.src||(sourceEl && (sourceEl.src||sourceEl.getAttribute('src')))||null;
+                if(rawSrc && rawSrc.startsWith('blob:')) rawSrc=null;
+                if(rawSrc) pushStreamUrl(rawSrc);
+                let streamUrl=findBestStreamForMedia(mediaId);
+                if(!streamUrl && rawSrc && isStreamUrl(rawSrc)) streamUrl=rawSrc;
+                let title=null;
+                if(mediaTitle&&mediaTitle.trim()) title=mediaTitle.trim();
+                else if(selTitle&&selTitle.trim()) title=selTitle.trim();
+                else if(poster) title=`Tenbyte-${mediaId||'video'}`;
+                if(title){
+                    title=title.trim();
+                    let link=streamUrl||rawSrc||poster||(mediaId?`tenbyte://${mediaId}`:null);
+                    if(link && !link.startsWith('blob:')){
+                        let category=selCategory||'Uncategorized';
+                        saveEntry(title, link, category, {mediaId, poster, streamUrl, rawSrc, via: streamUrl?'video+stream':'video'});
                     }
                 }
             }
-        } catch(e) { console.warn('[VidDB] tb err', e); }
+        } catch(e){ console.warn('[VidDB] tb err',e); }
 
-        if (dirty) {
-            safeSetDB(db);
-            updateBtnCounter();
-        }
+        // 3) Bulk from API cache (if user never visited each lesson, API may have provided all lessons)
+        // We don't auto-save all to avoid flooding, but if DB is empty, we can seed from cache
+        try {
+            if (apiLessonCache.size && Object.keys(db).length < 3) {
+                for (const [k,v] of apiLessonCache.entries()){
+                    if (!db[k] && !Object.values(db).some(e=>e.title===v.title)){
+                        // Only seed if we have a real link
+                        if (v.link) saveEntry(v.title, v.link, v.category||'Uncategorized', {via: 'api-seed'});
+                    }
+                }
+            }
+        } catch {}
+
+        if (dirty){ safeSetDB(db); updateBtnCounter(); }
     }
 
-    function attachUIListeners() {
-        btn.addEventListener('click', () => {
-            renderCategories();
-            modal.style.display = 'flex';
-        });
-        document.getElementById('vid-close-btn').addEventListener('click', () => { modal.style.display = 'none'; });
+    function attachUIListeners(){
+        btn.addEventListener('click', ()=>{ renderCategories(); modal.style.display='flex'; });
+        document.getElementById('vid-close-btn').addEventListener('click', ()=>{ modal.style.display='none'; });
         document.getElementById('vid-search').addEventListener('input', triggerSearch, {passive:true});
         document.getElementById('vid-sort').addEventListener('change', renderCategories);
-        document.getElementById('vid-master-checkbox').addEventListener('change', (e) => {
-            const isChecked = e.target.checked;
+        document.getElementById('vid-master-checkbox').addEventListener('change', (e)=>{
+            const isChecked=e.target.checked;
             document.querySelectorAll('.vid-category-group:not([style*="display: none"]) .row-checkbox').forEach(cb=>{
-                const tr = cb.closest('tr');
-                if (!tr || tr.style.display==='none') return;
-                cb.checked = isChecked;
+                const tr=cb.closest('tr'); if(!tr||tr.style.display==='none') return; cb.checked=isChecked;
             });
-            // sync category checkboxes
             document.querySelectorAll('.cat-checkbox').forEach(cb=>{
-                const grp = cb.closest('.vid-category-group');
-                if (!grp || grp.style.display==='none') return;
-                cb.checked = isChecked;
+                const grp=cb.closest('.vid-category-group'); if(!grp||grp.style.display==='none') return; cb.checked=isChecked;
             });
         });
-        document.getElementById('vid-select-all').addEventListener('click', () => {
+        document.getElementById('vid-select-all').addEventListener('click', ()=>{
             document.querySelectorAll('.vid-category-group:not([style*="display: none"]) .row-checkbox, .cat-checkbox').forEach(cb=>{
-                const grp = cb.closest('.vid-category-group');
-                const tr = cb.closest('tr');
-                if (grp && grp.style.display==='none') return;
-                if (tr && tr.style.display==='none') return;
-                cb.checked = true;
+                const grp=cb.closest('.vid-category-group'); const tr=cb.closest('tr');
+                if(grp&&grp.style.display==='none') return; if(tr&&tr.style.display==='none') return; cb.checked=true;
             });
-            const m = document.getElementById('vid-master-checkbox');
-            if (m) m.checked = true;
+            const m=document.getElementById('vid-master-checkbox'); if(m) m.checked=true;
         });
-        // Event delegation for category toggles / per-category checkbox
-        const list = document.getElementById('vid-list-container');
+        const list=document.getElementById('vid-list-container');
         list.addEventListener('click', (e)=>{
-            const header = e.target.closest('.vid-category-header');
-            if (!header) return;
-            if (e.target.classList.contains('cat-checkbox')) return;
-            const group = header.closest('.vid-category-group');
-            const content = group.querySelector('.vid-category-content');
-            const toggle = header.querySelector('.vid-cat-toggle');
-            const isOpen = content.style.display === 'block';
-            content.style.display = isOpen ? 'none' : 'block';
-            if (toggle) toggle.textContent = isOpen ? '▶' : '▼';
+            const header=e.target.closest('.vid-category-header'); if(!header) return;
+            if(e.target.classList.contains('cat-checkbox')) return;
+            const group=header.closest('.vid-category-group');
+            const content=group.querySelector('.vid-category-content');
+            const toggle=header.querySelector('.vid-cat-toggle');
+            const isOpen=content.style.display==='block';
+            content.style.display=isOpen?'none':'block'; if(toggle) toggle.textContent=isOpen?'▶':'▼';
         });
         list.addEventListener('change', (e)=>{
-            if (!e.target.classList.contains('cat-checkbox')) return;
-            const isChecked = e.target.checked;
-            const group = e.target.closest('.vid-category-group');
+            if(!e.target.classList.contains('cat-checkbox')) return;
+            const isChecked=e.target.checked;
+            const group=e.target.closest('.vid-category-group');
             group.querySelectorAll('.row-checkbox').forEach(cb=>{
-                const tr = cb.closest('tr');
-                if (tr && tr.style.display==='none') return;
-                cb.checked = isChecked;
+                const tr=cb.closest('tr'); if(tr&&tr.style.display==='none') return; cb.checked=isChecked;
             });
         });
-        function cleanName(name) { return name.replace(/[,;|]/g,'_').replace(/_+/g,'_').trim(); }
-        document.getElementById('vid-copy-names').addEventListener('click', () => {
-            const sel = Array.from(document.querySelectorAll('.row-checkbox:checked')).map(cb=> cleanName(cb.dataset.name || cb.dataset.key || ''));
-            if (!sel.length) return showToast('⚠️ Nothing selected!');
-            GM_setClipboard(sel.join(' | '));
-            showToast(`✅ Copied ${sel.length} names!`);
+        function cleanName(name){ return name.replace(/[,;|]/g,'_').replace(/_+/g,'_').trim(); }
+        document.getElementById('vid-copy-names').addEventListener('click', ()=>{
+            const sel=Array.from(document.querySelectorAll('.row-checkbox:checked')).map(cb=> cleanName(cb.dataset.name||cb.dataset.key||''));
+            if(!sel.length) return showToast('⚠️ Nothing selected!');
+            GM_setClipboard(sel.join(' | ')); showToast(`✅ Copied ${sel.length} names!`);
         });
-        document.getElementById('vid-copy-links').addEventListener('click', () => {
-            const db = safeGetDB();
-            const keys = Array.from(document.querySelectorAll('.row-checkbox:checked')).map(cb=> cb.dataset.key || cb.dataset.name);
-            if (!keys.length) return showToast('⚠️ Nothing selected!');
-            const links = keys.map(k=> db[k]?.link || db[k]?.streamUrl || db[k]?.poster || '').filter(Boolean);
-            if (!links.length) return showToast('⚠️ No links found (migrated?)');
-            GM_setClipboard(links.join(' | '));
-            showToast(`✅ Copied ${links.length} links!`);
+        document.getElementById('vid-copy-links').addEventListener('click', ()=>{
+            const db=safeGetDB();
+            const keys=Array.from(document.querySelectorAll('.row-checkbox:checked')).map(cb=> cb.dataset.key||cb.dataset.name);
+            if(!keys.length) return showToast('⚠️ Nothing selected!');
+            const links=keys.map(k=> db[k]?.link||db[k]?.streamUrl||db[k]?.poster||'').filter(Boolean);
+            if(!links.length) return showToast('⚠️ No links found');
+            GM_setClipboard(links.join(' | ')); showToast(`✅ Copied ${links.length} links!`);
         });
-        document.getElementById('vid-clear-all').addEventListener('click', () => {
-            if (!confirm('⚠️ Delete ALL saved videos? This cannot be undone.')) return;
-            safeSetDB({});
-            lastSavedSig = '';
-            renderCategories();
-            updateBtnCounter();
-            const s = document.getElementById('vid-search');
-            if (s) s.value = '';
-            const m = document.getElementById('vid-master-checkbox');
-            if (m) m.checked = false;
+        document.getElementById('vid-clear-all').addEventListener('click', ()=>{
+            if(!confirm('⚠️ Delete ALL saved videos?')) return;
+            safeSetDB({}); lastSavedSig=''; renderCategories(); updateBtnCounter();
+            const s=document.getElementById('vid-search'); if(s) s.value='';
+            const m=document.getElementById('vid-master-checkbox'); if(m) m.checked=false;
             showToast('🗑️ Database Cleared!');
         });
-        // Close on outside click / Esc
-        modal.addEventListener('click', (e)=>{ if (e.target===modal) modal.style.display='none'; });
-        document.addEventListener('keydown', (e)=>{ if (e.key==='Escape' && modal.style.display!=='none') modal.style.display='none'; });
+        modal.addEventListener('click', (e)=>{ if(e.target===modal) modal.style.display='none'; });
+        document.addEventListener('keydown', (e)=>{ if(e.key==='Escape' && modal.style.display!=='none') modal.style.display='none'; });
     }
 
-    function init() {
+    function init(){
         migrateDB();
         createUI();
-        // Throttled polling + visibility-aware
-        let iv = setInterval(()=>{ if (!document.hidden) scanForVideo(); }, 2500);
+        let iv=setInterval(()=>{ if(!document.hidden) scanForVideo(); }, 2600);
         document.addEventListener('visibilitychange', ()=>{
-            if (document.hidden) { clearInterval(iv); iv=null; }
-            else if (!iv) { scanForVideo(); iv=setInterval(()=>{ if (!document.hidden) scanForVideo(); }, 2500); }
+            if(document.hidden){ clearInterval(iv); iv=null; }
+            else if(!iv){ scanForVideo(); iv=setInterval(()=>{ if(!document.hidden) scanForVideo(); }, 2600); }
         });
-        setTimeout(scanForVideo, 800);
-        setTimeout(scanForVideo, 2000);
-        setTimeout(scanForVideo, 4000);
-        // Quick console hint for debugging not-capturing
-        console.log('[VidDB] init done. If not capturing, check: document.querySelectorAll("iframe").length, document.querySelector("video") and run localStorage GM debug. See console ticks every ~15 scans.');
-        // Throttled observer: watch iframes src + video attrs, and general DOM for player swap
-        try {
-            const target = document.querySelector('.tb-player__video-container') || document.body;
-            const obs = new MutationObserver(()=> scheduleScan());
-            obs.observe(target, { childList:true, subtree:true, attributes:true, attributeFilter:['src','poster','data-media-id','data-media-title','title'] });
-            // Permanent observer for iframe src changes (player navigation is src swap)
-            const iframeObs = new MutationObserver(()=> scheduleScan());
-            iframeObs.observe(document.body, { childList:true, subtree:true, attributes:true, attributeFilter:['src'] });
-            // Also hook popstate / pushState for SPA navigation
-            const origPush = history.pushState;
-            history.pushState = function(...a){ const r=origPush.apply(this,a); scheduleScan(); setTimeout(scanForVideo, 600); return r; };
-            window.addEventListener('popstate', ()=>{ scheduleScan(); setTimeout(scanForVideo, 600); });
-        } catch(e) {}
+        setTimeout(scanForVideo, 900);
+        setTimeout(scanForVideo, 2200);
+        setTimeout(scanForVideo, 4200);
+        console.log('[VidDB] v4.0 init (new site layout). If Uncategorized, check headerP selector: document.querySelector(\"div.flex.items-center.gap-3.border-b.bg-brand-0 p\")');
+        try{
+            const target=document.querySelector('.tb-player__video-container') || document.querySelector('div.video-container') || document.body;
+            const obs=new MutationObserver(()=> scheduleScan());
+            obs.observe(target, {childList:true, subtree:true, attributes:true, attributeFilter:['src','poster','data-media-id','data-media-title','title']});
+            const iframeObs=new MutationObserver(()=> scheduleScan());
+            iframeObs.observe(document.body, {childList:true, subtree:true, attributes:true, attributeFilter:['src']});
+            const origPush=history.pushState;
+            history.pushState=function(...a){ const r=origPush.apply(this,a); scheduleScan(); setTimeout(scanForVideo,700); return r; };
+            window.addEventListener('popstate', ()=>{ scheduleScan(); setTimeout(scanForVideo,700); });
+            // Also watch URL param change (lesson navigation is pushState)
+            let lastHref=location.href;
+            setInterval(()=>{ if(location.href!==lastHref){ lastHref=location.href; scheduleScan(); setTimeout(scanForVideo,800); } }, 1000);
+        }catch(e){}
     }
-    if (document.body) init();
+    if(document.body) init();
     else document.addEventListener('DOMContentLoaded', init);
 })();
