@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EdgeCourseBD Video Extractor & Manager (Categorized + Search + Sort)
 // @namespace    http://tampermonkey.net/
-// @version      4.3
-// @description  Extracts Vimeo / Tenbyte-Vidinfra (tb-player) links, auto-categorizes nested Course Content > Academic Class > Subject (all parents, Academic Classes - stripped), low-end optimized - capture fix.
+// @version      4.4
+// @description  Extracts Vimeo / Tenbyte-Vidinfra (tb-player) links, auto-categorizes nested Course Content > Academic Class > Subject (all parents, Academic Classes - stripped) - uncategorized fix.
 // @author       ShoyebOP
 // @downloadURL  https://github.com/ShoyebOP/My-Userscripts/raw/refs/heads/main/EdgeCourseBD-Video-Extractor.user.js
 // @updateURL    https://github.com/ShoyebOP/My-Userscripts/raw/refs/heads/main/EdgeCourseBD-Video-Extractor.user.js
@@ -454,28 +454,33 @@
     function getHeadingForRegion(region) {
         if (!region) return null;
         try {
-            // Heading is previousElementSibling (h3) which contains button > p.line-clamp-2
+            // Heading is previousElementSibling (h3) which contains button > p
             let headingBtn = region.previousElementSibling;
             if (headingBtn) {
-                const p = headingBtn.querySelector('p.line-clamp-2');
+                // Try multiple selectors for heading text
+                const p = headingBtn.querySelector('p.line-clamp-2') || headingBtn.querySelector('p.font-semibold') || headingBtn.querySelector('p');
                 if (p && p.textContent.trim()) return p.textContent.trim();
                 // Fallback: button text without count badge - clone and remove count span
                 try {
                     const clone = headingBtn.cloneNode(true);
                     const countBadge = clone.querySelector('span.ml-auto');
                     if (countBadge) countBadge.remove();
+                    // Remove svg
+                    const svg = clone.querySelector('svg');
+                    if (svg) svg.remove();
                     const txt = clone.textContent.trim().split('\n')[0].trim();
-                    if (txt) return txt;
+                    if (txt && txt.length > 2 && txt.length < 80) return txt;
                 } catch {}
                 const txt2 = headingBtn.textContent.trim().split('\n')[0].trim();
-                if (txt2) return txt2;
+                if (txt2 && txt2.length > 2 && txt2.length < 80) return txt2;
             }
             // Alternative: region is inside a vertical, the vertical's h3 is heading
             const v = region.closest('div[data-orientation="vertical"]');
             if (v) {
                 let b = null;
-                try { b = v.querySelector('h3 > button p.line-clamp-2'); } catch {}
-                if (!b) try { b = v.querySelector('h3 p.line-clamp-2'); } catch {}
+                try { b = v.querySelector('h3 button p.line-clamp-2'); } catch {}
+                if (!b) try { b = v.querySelector('h3 button p'); } catch {}
+                if (!b) try { b = v.querySelector('h3 p'); } catch {}
                 if (b && b.textContent.trim()) return b.textContent.trim();
             }
         } catch {}
@@ -624,6 +629,60 @@
             else {
                 const openRegion = document.querySelector('div[role="region"]:not([hidden])');
                 if (openRegion) categoryPath = collectCategoryPath(openRegion);
+                else {
+                    // Try any button[data-state="open"] headings - collects all open categories even if region not yet found
+                    const openHeadings = Array.from(document.querySelectorAll('button[data-state="open"] p.line-clamp-2'))
+                        .map(p => normalizeCategorySegment(p.textContent.trim())).filter(Boolean);
+                    if (openHeadings.length) categoryPath = openHeadings;
+                }
+            }
+        }
+        // Fallback: collect ALL currently open headings as path (ensures parent categories not missed)
+        if (!categoryPath.length || categoryPath.length === 1) {
+            // If we only got one segment (e.g., just Course Content), try to augment with all open headings
+            let allOpenHeadings = [];
+            try {
+                allOpenHeadings = Array.from(document.querySelectorAll('button[data-state="open"] p.line-clamp-2, button[data-state="open"] p.font-semibold, button[data-state="open"] p, div[role="region"]:not([hidden]) + h3 p'))
+                    .map(p => normalizeCategorySegment(p.textContent.trim())).filter(Boolean);
+            } catch {}
+            // Also include h2 of Course Content section
+            let secH2 = null;
+            try { secH2 = document.querySelector('section[id="section_course content"] h2'); } catch {}
+            if (!secH2) try { secH2 = document.querySelector('section[id*="section_course"] h2'); } catch {}
+            if (!secH2) {
+                // Fallback: any section h2 that looks like Course Content
+                const allH2 = Array.from(document.querySelectorAll('section h2'));
+                for (const h of allH2) if (/Course Content|Course Outline/i.test(h.textContent)) { secH2 = h; break; }
+            }
+            if (!secH2) secH2 = document.querySelector('section h2');
+            if (secH2) {
+                const n = normalizeCategorySegment(secH2.textContent.trim());
+                if (n && !allOpenHeadings.includes(n)) allOpenHeadings.unshift(n);
+            }
+            // If still empty, try any visible p.line-clamp-2 that is a heading (not lesson)
+            if (!allOpenHeadings.length) {
+                try {
+                    const allPs = Array.from(document.querySelectorAll('p.line-clamp-2, p.font-semibold'));
+                    for (const p of allPs) {
+                        const txt = p.textContent.trim();
+                        if (/Academic Class|Course Content|Course Outline|Demo/i.test(txt)) {
+                            const n = normalizeCategorySegment(txt);
+                            if (n && !allOpenHeadings.includes(n)) allOpenHeadings.push(n);
+                        }
+                    }
+                } catch {}
+            }
+            if (allOpenHeadings.length > categoryPath.length) {
+                // Prefer the more complete path
+                // Deduplicate and keep order: Course Content first, then Academic Class, then Subject
+                const merged = [];
+                for (const seg of [...allOpenHeadings, ...categoryPath]) if (!merged.includes(seg)) merged.push(seg);
+                // Also include any path segments from activeEl's ancestors that might be missing
+                if (merged.length > 1) categoryPath = merged;
+            }
+            // Debug log for uncategorized
+            if (!categoryPath.length) {
+                console.warn('[VidDB] still uncategorized, openHeadings:', allOpenHeadings, 'secH2:', secH2?.textContent?.trim());
             }
         }
         // Fallback to section h2
@@ -650,10 +709,34 @@
             for (const s of normed) if (uniq[uniq.length-1]!==s) uniq.push(s);
             category = uniq.join(' > ');
         } else {
-            const h1 = document.querySelector('h1');
-            if (h1) {
-                const n = normalizeCategorySegment(h1.textContent.trim());
-                if (n) category = n;
+            // Final fallbacks - try h1, then api cache, then document.title
+            let h1Cat = null;
+            try {
+                const h1 = document.querySelector('h1');
+                if (h1 && h1.textContent.trim()) {
+                    h1Cat = h1.textContent.trim().replace(/\s+/g,' ').slice(0,60);
+                    const n = normalizeCategorySegment(h1Cat);
+                    if (n) category = n;
+                    else if (h1Cat.length > 2) category = h1Cat;
+                }
+            } catch {}
+            if (category === 'Uncategorized') {
+                // Try apiLessonCache for current lessonId
+                try {
+                    const lessonId = new URLSearchParams(location.search).get('lesson');
+                    if (lessonId) {
+                        for (const v of apiLessonCache.values()) {
+                            // api cache may have lessonId in link or key
+                            if (v.link && v.link.includes(lessonId)) { category = v.category; break; }
+                        }
+                    }
+                } catch {}
+            }
+            if (category === 'Uncategorized') {
+                // Last resort: use document.title first part or Course Content
+                const dt = document.title ? document.title.split('|')[0].trim() : '';
+                if (dt && dt.length > 3 && dt.length < 80) category = dt;
+                else category = 'Course Content';
             }
         }
         if (title) title = title.replace(/\s+/g,' ').trim();
