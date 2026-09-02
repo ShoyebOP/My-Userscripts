@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EdgeCourseBD Video Extractor & Manager (Categorized + Search + Sort)
 // @namespace    http://tampermonkey.net/
-// @version      4.0
-// @description  Extracts Vimeo / Tenbyte-Vidinfra (tb-player) links, auto-categorizes via new EdgeCourse layout (radix accordion + iframe + API hook), low-end optimized.
+// @version      4.1
+// @description  Extracts Vimeo / Tenbyte-Vidinfra (tb-player) links, auto-categorizes nested Course Content > Academic Class > Subject (Academic Classes - stripped), low-end optimized.
 // @author       ShoyebOP
 // @downloadURL  https://github.com/ShoyebOP/My-Userscripts/raw/refs/heads/main/EdgeCourseBD-Video-Extractor.user.js
 // @updateURL    https://github.com/ShoyebOP/My-Userscripts/raw/refs/heads/main/EdgeCourseBD-Video-Extractor.user.js
@@ -33,43 +33,39 @@
             console.log('[VidDB][StreamHook] Captured:', url);
         }
     }
-    // Bulk capture from course API (new site loads lessons via JSON)
-    const apiLessonCache = new Map(); // lessonId -> {title, category, link}
+    // Bulk capture from course API (new site loads lessons via JSON) - now handles nested hierarchy
+    const apiLessonCache = new Map(); // lessonTitle -> {title, category, link}
     function handleCourseApiResponse(url, json) {
         try {
             let count = 0;
-            function walk(node, curCat) {
+            function walk(node, curPath) {
                 if (!node || typeof node !== 'object') return;
-                if (Array.isArray(node)) { node.forEach(n=>walk(n,curCat)); return; }
+                if (Array.isArray(node)) { node.forEach(n=>walk(n,curPath)); return; }
                 const title = node.title || node.name || node.lesson_title || node.lessonName || node.videoTitle || node.label;
                 const link = node.videoUrl || node.video_url || node.playerUrl || node.player_url || node.src || node.url || node.link || node.iframe || node.mediaUrl || node.video_url_hls;
-                // Detect chapter/category container
-                let newCat = curCat;
-                if (node.categoryName || node.chapterTitle || node.sectionTitle || node.groupName) {
-                    newCat = node.categoryName || node.chapterTitle || node.sectionTitle || node.groupName;
-                } else if (title && (node.lessons || node.videos || node.items || node.children || node.modules)) {
-                    newCat = title;
+                // Detect category container and build hierarchical path
+                let newPath = curPath ? [...curPath] : [];
+                const rawCat = node.categoryName || node.chapterTitle || node.sectionTitle || node.groupName;
+                if (rawCat) {
+                    const norm = String(rawCat).replace(/^\s*Academic Classes\s*-\s*/i,'').trim();
+                    if (norm && !newPath.includes(norm)) newPath.push(norm);
+                } else if (title && (node.lessons || node.videos || node.items || node.children || node.modules || node.chapters)) {
+                    const norm = String(title).replace(/^\s*Academic Classes\s*-\s*/i,'').trim();
+                    if (norm && !newPath.includes(norm)) newPath.push(norm);
                 }
                 if (title && link && typeof link === 'string' && /vidinfra|tenbyte|vimeo|player|m3u8|mpd/i.test(link)) {
-                    // Heuristic: title should be lesson, not generic section, so check parent category exists
-                    const cat = newCat && newCat !== title ? newCat : (curCat || 'Uncategorized');
-                    const key = title.trim();
+                    // This is a lesson leaf - use hierarchical path as category
+                    const cat = newPath.length ? newPath.join(' > ') : (curPath ? curPath.join(' > ') : 'Uncategorized');
+                    const key = String(title).trim();
+                    const normCat = cat.split(' > ').map(s=> s.replace(/^\s*Academic Classes\s*-\s*/i,'').trim()).filter(Boolean).join(' > ');
                     if (!apiLessonCache.has(key)) {
-                        apiLessonCache.set(key, {title: key, category: cat, link});
+                        apiLessonCache.set(key, {title: key, category: normCat, link});
                         count++;
                     }
-                    // Also try to save directly if we haven't yet
-                    const db = safeGetDB();
-                    let already = false;
-                    for (const v of Object.values(db)) if (v.title===key) {already=true;break;}
-                    if (!already) {
-                        // Don't auto-save all api lessons immediately to avoid spam, but queue for bulk save when user opens modal
-                        // Instead save if apiLessonCache size small? We'll save lazily in bulkCapture()
-                    }
                 }
-                for (const v of Object.values(node)) if (typeof v==='object') walk(v, newCat);
+                for (const v of Object.values(node)) if (typeof v==='object') walk(v, newPath);
             }
-            walk(json, null);
+            walk(json, []);
             if (count) console.log(`[VidDB][API] Parsed ${count} lessons from ${url.slice(0,80)}`);
         } catch(e) { console.warn('[VidDB] api walk err', e); }
     }
@@ -179,6 +175,10 @@
                 if (!e || typeof e !== 'object') { delete db[k]; continue; }
                 if (!e.savedAt) e.savedAt = Date.now();
                 if (!e.category) e.category = 'Uncategorized';
+                // Normalize hierarchical category (strip prefix)
+                if (e.category) {
+                    e.category = String(e.category).split(' > ').map(s=> s.replace(/^\s*Academic Classes\s*-\s*/i,'').trim()).filter(Boolean).join(' > ') || 'Uncategorized';
+                }
                 if (e.link && e.link.startsWith('blob:')) {
                     const better = e.streamUrl || e.poster || (e.mediaId ? `tenbyte://${e.mediaId}` : null);
                     if (better) e.link = better; else delete db[k];
@@ -206,6 +206,9 @@
             val.title=String(val.title).trim();
             val.category=(val.category||'Uncategorized').trim()||'Uncategorized';
             if (val.category==='Uncategorized / Extra') val.category='Uncategorized';
+            // Strip Academic Classes - prefix and normalize hierarchical separator
+            val.category = val.category.split(' > ').map(s=> s.replace(/^\s*Academic Classes\s*-\s*/i,'').trim()).filter(Boolean).join(' > ');
+            if (!val.category) val.category='Uncategorized';
             if (val.link && val.link.startsWith('blob:')) {
                 const better=val.streamUrl||val.poster||(val.mediaId?`tenbyte://${val.mediaId}`:null);
                 if (better){val.link=better;changed=true;} else continue;
@@ -431,31 +434,130 @@
         });
     }
 
-    // --- NEW SITE TITLE/CATEGORY EXTRACTION ---
-    function getNewSiteTitleAndCategory() {
-        // Title: the header directly below player (অধ্যায়-০১...) is most reliable for current video
-        let title = null;
-        let category = 'Uncategorized';
-
-        // 1) New site: header below video player (the <p> with min-w-0)
-        const headerP = document.querySelector('div.flex.items-center.gap-3.border-b.bg-brand-0 p');
-        if (headerP && headerP.textContent.trim()) {
-            const t = headerP.textContent.trim();
-            // Filter out generic "Course Outline" etc? Keep if it looks like a lecture title
-            if (t.length > 3 && t.length < 200) title = t;
+    // --- NEW SITE TITLE/CATEGORY EXTRACTION (nested: Course Content > Academic Class(Basic to Indetails) > Subject > Class) ---
+    function stripAcademicPrefix(s) {
+        if (!s) return s;
+        return s.replace(/^\s*Academic Classes\s*-\s*/i, '').replace(/^\s*Academic Class\s*\(Basic to Indetails\)\s*[-–]?\s*/i, 'Academic Class (Basic to Indetails) ').trim().replace(/\s+/g,' ').trim();
+    }
+    function normalizeCategorySegment(seg) {
+        if (!seg) return null;
+        let t = seg.replace(/\s+/g,' ').trim();
+        if (!t || t.length < 2 || t.length > 80) return null;
+        // Strip prefix
+        t = t.replace(/^\s*Academic Classes\s*-\s*/i, '').trim();
+        // Ignore generic toggle counts like "12" alone
+        if (/^\d+$/.test(t)) return null;
+        return t;
+    }
+    function collectCategoryPath(activeEl) {
+        if (!activeEl) return [];
+        const path = [];
+        const seen = new Set();
+        let cur = activeEl;
+        // Walk up through nested regions
+        for (let depth=0; depth<6 && cur; depth++) {
+            const region = cur.closest('div[role="region"]');
+            if (!region) break;
+            // Heading is previousElementSibling (h3) or parent's first button
+            let headingText = null;
+            const headingBtn = region.previousElementSibling;
+            if (headingBtn) {
+                const p = headingBtn.querySelector('p.line-clamp-2');
+                if (p && p.textContent.trim()) headingText = p.textContent.trim();
+                else {
+                    // Button text without count badge
+                    const txt = headingBtn.textContent.trim().split('\n')[0].trim();
+                    if (txt) headingText = txt;
+                }
+            }
+            // Also check parent vertical's heading if not found
+            if (!headingText) {
+                const v = region.closest('div[data-orientation="vertical"]');
+                if (v) {
+                    const b = v.querySelector(':scope > h3 > button p.line-clamp-2');
+                    if (b && b.textContent.trim()) headingText = b.textContent.trim();
+                }
+            }
+            const norm = normalizeCategorySegment(headingText);
+            if (norm && !seen.has(norm)) { path.unshift(norm); seen.add(norm); }
+            // Add section h2 as top level if not yet added
+            const sec = region.closest('section');
+            if (sec) {
+                const h2 = sec.querySelector('h2');
+                if (h2) {
+                    const secTxt = h2.textContent.trim();
+                    const n2 = normalizeCategorySegment(secTxt);
+                    if (n2 && !seen.has(n2)) { path.unshift(n2); seen.add(n2); }
+                }
+            }
+            // Move to outer region
+            const parent = region.parentElement;
+            if (!parent || parent === cur) break;
+            cur = parent;
+            if (!cur.closest('div[role="region"]')) break;
         }
-        // Fallback: any p with অধ্যায় or Part near player
-        if (!title) {
-            const candidates = Array.from(document.querySelectorAll('p.min-w-0.text-sm, p.line-clamp-2'));
-            for (const p of candidates) {
-                const txt = p.textContent.trim();
-                if (/অধ্যায়|Part|Lecture|Class|Chapter/i.test(txt) && txt.length < 120 && txt.length > 5) {
-                    // Prefer the one closest to video-container
-                    title = txt; break;
+        // Also ensure top course name not needed - we already have section h2
+        return path;
+    }
+    function findActiveLessonEl() {
+        const lessonId = new URLSearchParams(location.search).get('lesson');
+        if (lessonId) {
+            const byHref = document.querySelector(`a[href*="lesson=${lessonId}"]`);
+            if (byHref) return byHref;
+            const byData = document.querySelector(`[data-lesson="${lessonId}"]`);
+            if (byData) return byData;
+            // Sometimes lesson link is button with onclick containing lesson id
+            const all = Array.from(document.querySelectorAll('a, button'));
+            for (const el of all) {
+                const outer = el.outerHTML || '';
+                if (outer.includes(lessonId) && el.textContent.trim().length < 120 && el.textContent.trim().length > 3) {
+                    if (el.closest('div[role="region"], section')) return el;
                 }
             }
         }
-        // Fallback to h1 course name + lesson id
+        // Active lesson has distinct active styling: bg-brand-500 text-white or ring or aria-current
+        let el = document.querySelector('[aria-current="true"]');
+        if (el) return el;
+        // Look inside open regions for an element with active background
+        const openRegions = Array.from(document.querySelectorAll('div[role="region"]:not([hidden])'));
+        for (const r of openRegions) {
+            // Common active pattern: bg-brand-500 or bg-brand-0 with text-brand
+            const cand = r.querySelector('[class*="bg-brand-500"], [class*="bg-brand-0"][class*="text-brand"], [class*="ring-brand"]');
+            if (cand && cand.textContent.trim().length < 120) return cand;
+            // Fallback: any button that is not a category heading but a lesson row
+            const rows = r.querySelectorAll('a, button');
+            for (const row of rows) {
+                if (row.closest('h3')) continue; // skip category heading
+                if (row.textContent.trim().length > 0 && row.textContent.trim().length < 100) {
+                    // Heuristic: lesson row often has play icon or small text, check if it is inside region and not a heading
+                    if (row.querySelector('svg') || row.textContent.includes('Class') || row.textContent.includes('Lecture') || row.textContent.includes('অধ্যায়')) {
+                        return row;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+    function getNewSiteTitleAndCategory() {
+        let title = null;
+        let categoryPath = [];
+
+        // Title: header below player is most reliable for current video class name
+        const headerP = document.querySelector('div.flex.items-center.gap-3.border-b.bg-brand-0 p');
+        if (headerP && headerP.textContent.trim()) {
+            const t = headerP.textContent.trim();
+            if (t.length > 3 && t.length < 200) title = t;
+        }
+        if (!title) {
+            const cands = Array.from(document.querySelectorAll('p.min-w-0.text-sm, p.line-clamp-2'));
+            for (const p of cands) {
+                const txt = p.textContent.trim();
+                if (/অধ্যায়|Part|Lecture|Class|Chapter/i.test(txt) && txt.length < 120 && txt.length > 5) {
+                    // Prefer header near video-container
+                    if (p.closest('div.overflow-hidden.rounded-xl')) { title = txt; break; }
+                }
+            }
+        }
         if (!title) {
             const h1 = document.querySelector('h1');
             const lessonId = new URLSearchParams(location.search).get('lesson');
@@ -463,77 +565,52 @@
             else if (h1 && h1.textContent.trim().length < 80) title = h1.textContent.trim();
         }
 
-        // 2) Category: find open accordion category heading
-        // Try to locate active lesson element first, then derive category
-        const lessonId = new URLSearchParams(location.search).get('lesson');
-        let activeLessonEl = null;
-        if (lessonId) {
-            activeLessonEl = document.querySelector(`a[href*="lesson=${lessonId}"]`) || document.querySelector(`[data-lesson="${lessonId}"]`);
-        }
-        if (!activeLessonEl) {
-            // Look for element with bg-brand-500 text-white inside Course Content (active lesson)
-            const contentSection = document.querySelector('section#section_course\\ content') || document.querySelector('section');
-            if (contentSection) {
-                // Active lesson likely has bg-brand-500 or bg-brand-0 with ring
-                activeLessonEl = contentSection.querySelector('[class*="bg-brand-500"]');
-                if (activeLessonEl && activeLessonEl.textContent.trim().length > 100) activeLessonEl = null; // ignore section header
+        // Category path via active lesson hierarchy
+        const activeEl = findActiveLessonEl();
+        if (activeEl) {
+            categoryPath = collectCategoryPath(activeEl);
+            const lessonTxt = activeEl.textContent.trim().split('\n')[0].trim();
+            // If active lesson text is distinct from headerP, prefer it as title (leaf class name)
+            if (lessonTxt && lessonTxt.length < 150 && lessonTxt.length > 3 && lessonTxt !== categoryPath[categoryPath.length-1]) {
+                // Only override if headerP title is generic or duplicate
+                if (!title || lessonTxt.length < title.length + 20) title = lessonTxt;
             }
         }
-        if (!activeLessonEl) activeLessonEl = document.querySelector('[aria-current="true"]');
-
-        // If we found active lesson, title from it beats headerP
-        if (activeLessonEl) {
-            const lessonTxt = activeLessonEl.textContent.trim().split('\n')[0].trim();
-            if (lessonTxt && lessonTxt.length < 150) title = lessonTxt;
-            // Find its category (nearest region's heading)
-            const region = activeLessonEl.closest('div[role="region"]');
-            if (region) {
-                const headingBtn = region.previousElementSibling;
-                if (headingBtn) {
-                    const p = headingBtn.querySelector('p.line-clamp-2') || headingBtn.querySelector('p');
-                    if (p && p.textContent.trim()) category = p.textContent.trim();
-                }
-            }
-            if (category === 'Uncategorized') {
-                const catBtn = activeLessonEl.closest('div[data-orientation="vertical"]')?.querySelector('button p.line-clamp-2');
-                if (catBtn) category = catBtn.textContent.trim();
-            }
-        }
-
-        // If no active lesson, try open region's heading as category
-        if (category === 'Uncategorized') {
+        // If no active lesson, try open region's path
+        if (!categoryPath.length) {
             const openRegion = document.querySelector('div[role="region"]:not([hidden])');
-            if (openRegion) {
-                const btn = openRegion.previousElementSibling;
-                if (btn) {
-                    const p = btn.querySelector('p.line-clamp-2');
-                    if (p && p.textContent.trim()) category = p.textContent.trim();
-                    else if (btn.textContent.trim()) category = btn.textContent.trim().split('\n')[0].trim();
-                }
-                // Section h2 fallback
-                const sec = openRegion.closest('section');
-                if (category === 'Uncategorized' && sec) {
-                    const h2 = sec.querySelector('h2');
-                    if (h2) category = h2.textContent.trim();
+            if (openRegion) categoryPath = collectCategoryPath(openRegion);
+        }
+        // Fallback to section h2
+        if (!categoryPath.length) {
+            const sec = document.querySelector('section#section_course\\ content') || document.querySelector('section');
+            if (sec) {
+                const h2 = sec.querySelector('h2');
+                if (h2) {
+                    const n = normalizeCategorySegment(h2.textContent.trim());
+                    if (n) categoryPath = [n];
                 }
             }
         }
-        // Final fallback: section heading
-        if (category === 'Uncategorized') {
-            const secH2 = document.querySelector('section#section_course\\ content h2') || document.querySelector('section h2');
-            if (secH2 && secH2.textContent.trim()) category = secH2.textContent.trim();
-            else {
-                // Use h1 course name as category if nothing else
-                const h1 = document.querySelector('h1');
-                if (h1 && h1.textContent.trim()) category = h1.textContent.trim().slice(0,40);
+        // Build category string: Course Content > Academic Class(Basic to Indetails) > Subject
+        let category = 'Uncategorized';
+        if (categoryPath.length) {
+            // Normalize each segment (strip prefix) and dedupe consecutive duplicates
+            const normed = categoryPath.map(s=> s.replace(/^\s*Academic Classes\s*-\s*/i,'').trim()).filter(Boolean);
+            // Unique consecutive
+            const uniq = [];
+            for (const s of normed) if (uniq[uniq.length-1]!==s) uniq.push(s);
+            category = uniq.join(' > ');
+        } else {
+            const h1 = document.querySelector('h1');
+            if (h1) {
+                const n = normalizeCategorySegment(h1.textContent.trim());
+                if (n) category = n;
             }
         }
-
-        // Sanitize
-        if (title) title = title.replace(/\s+/g, ' ').trim();
-        if (category) category = category.replace(/\s+/g, ' ').trim();
-        if (category.length > 80) category = category.slice(0,80);
-
+        if (title) title = title.replace(/\s+/g,' ').trim();
+        if (category) category = category.replace(/\s+/g,' ').trim();
+        if (category.length > 120) category = category.slice(0,120);
         return {title, category, activeLessonEl};
     }
 
@@ -617,6 +694,8 @@
             if (!title || !title.trim() || !link || link.startsWith('blob:')) return false;
             title = title.trim(); category=(category||'Uncategorized').trim()||'Uncategorized';
             if (category==='Uncategorized / Extra') category='Uncategorized';
+            // Normalize hierarchical: split, strip Academic Classes - prefix, rejoin
+            category = category.split(' > ').map(s=> s.replace(/^\s*Academic Classes\s*-\s*/i,'').trim()).filter(Boolean).join(' > ') || 'Uncategorized';
             let key=title;
             const mediaId=extra.mediaId||null;
             if (mediaId){
