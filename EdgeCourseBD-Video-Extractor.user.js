@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EdgeCourseBD Video Extractor & Manager (Categorized + Search + Sort)
 // @namespace    http://tampermonkey.net/
-// @version      4.4
-// @description  Extracts Vimeo / Tenbyte-Vidinfra (tb-player) links, auto-categorizes nested Course Content > Academic Class > Subject (all parents, Academic Classes - stripped) - uncategorized fix.
+// @version      4.6
+// @description  Extracts Vimeo / Tenbyte-Vidinfra (tb-player) links, auto-categorizes nested Course Content > Academic Class > Subject (all parents, Academic Classes - stripped) - robust title/category fix.
 // @author       ShoyebOP
 // @downloadURL  https://github.com/ShoyebOP/My-Userscripts/raw/refs/heads/main/EdgeCourseBD-Video-Extractor.user.js
 // @updateURL    https://github.com/ShoyebOP/My-Userscripts/raw/refs/heads/main/EdgeCourseBD-Video-Extractor.user.js
@@ -586,29 +586,64 @@
         let title = null;
         let categoryPath = [];
 
-        // Title: header below player is most reliable for current video class name
+        // Title: robust multi-selector - header below player is most reliable
         let headerP = null;
-        try { headerP = document.querySelector('div.flex.items-center.gap-3.border-b.bg-brand-0 p'); } catch {}
-        if (!headerP) try { headerP = document.querySelector('p.min-w-0.text-sm.font-semibold'); } catch {}
+        const titleSelectors = [
+            'div.flex.items-center.gap-3.border-b.bg-brand-0 p',
+            'div.border-b.bg-brand-0 p',
+            'p.min-w-0.text-sm.font-semibold',
+            'div.overflow-hidden.rounded-xl p.font-semibold',
+            'div.overflow-hidden p.text-sm',
+            'h1 + div p', // fallback near h1
+        ];
+        for (const sel of titleSelectors) {
+            try { headerP = document.querySelector(sel); if (headerP && headerP.textContent.trim().length > 3) break; } catch {}
+            headerP = null;
+        }
         if (headerP && headerP.textContent.trim()) {
             const t = headerP.textContent.trim();
-            if (t.length > 3 && t.length < 200) title = t;
+            if (t.length > 3 && t.length < 200 && !/Course Progress|Course Outline|Course Content/i.test(t)) title = t;
         }
         if (!title) {
-            const cands = Array.from(document.querySelectorAll('p.min-w-0.text-sm, p.line-clamp-2'));
+            // Exhaustive search for any p/h containing অধ্যায়/Part near video
+            const cands = Array.from(document.querySelectorAll('p, h1, h2, h3'));
             for (const p of cands) {
                 const txt = p.textContent.trim();
-                if (/অধ্যায়|Part|Lecture|Class|Chapter/i.test(txt) && txt.length < 120 && txt.length > 5) {
-                    // Prefer header near video-container
-                    if (p.closest('div.overflow-hidden.rounded-xl')) { title = txt; break; }
+                if (!txt || txt.length < 5 || txt.length > 150) continue;
+                if (/অধ্যায়|Part\s*–|Part\s*-|Lecture\s*\d|Chapter\s*\d/i.test(txt)) {
+                    if (p.offsetParent !== null) { // visible
+                        // Prefer those near video-container or with Bengali
+                        if (p.closest('div.overflow-hidden.rounded-xl') || /অধ্যায়/.test(txt)) { title = txt; break; }
+                    }
+                }
+            }
+            // If still not, take first matching anywhere visible
+            if (!title) {
+                for (const p of cands) {
+                    const txt = p.textContent.trim();
+                    if (/অধ্যায়|Part\s*–|Lecture/i.test(txt) && txt.length < 120 && p.offsetParent !== null) { title = txt; break; }
                 }
             }
         }
         if (!title) {
             const h1 = document.querySelector('h1');
-            const lessonId = new URLSearchParams(location.search).get('lesson');
-            if (lessonId && h1) title = `${h1.textContent.trim()} - Lesson ${lessonId}`;
-            else if (h1 && h1.textContent.trim().length < 80) title = h1.textContent.trim();
+            if (h1 && h1.textContent.trim()) {
+                const h1txt = h1.textContent.trim();
+                const lessonId = new URLSearchParams(location.search).get('lesson');
+                // Only use h1 if it's not the generic site title
+                if (!/EdgeCourse BD/i.test(h1txt) && h1txt.length < 80) {
+                    title = h1txt;
+                    if (lessonId) title = `${h1txt} - Lesson ${lessonId}`;
+                }
+            }
+        }
+        // Last resort before document.title: try iframe title or video poster alt
+        if (!title) {
+            const iframe = document.querySelector('iframe[src*="vidinfra"], iframe[src*="player"]');
+            if (iframe) {
+                const it = iframe.getAttribute('title');
+                if (it && it.trim() && !it.includes('http') && it.trim().length < 100) title = it.trim();
+            }
         }
 
         // Category path via active lesson hierarchy - captures ALL ancestors (Course Content > Academic Class > Subject)
@@ -685,10 +720,15 @@
                 console.warn('[VidDB] still uncategorized, openHeadings:', allOpenHeadings, 'secH2:', secH2?.textContent?.trim());
             }
         }
-        // Fallback to section h2
+        // Fallback to section h2 - prefer Course Content
         if (!categoryPath.length) {
             let sec = null;
-            try { sec = document.querySelector('section[id="section_course content"]'); } catch {}
+            // Try to find Course Content section specifically
+            const allSecs = Array.from(document.querySelectorAll('section'));
+            for (const s of allSecs) {
+                const h2 = s.querySelector('h2');
+                if (h2 && /Course Content/i.test(h2.textContent)) { sec = s; break; }
+            }
             if (!sec) try { sec = document.querySelector('section[id*="section_course"]'); } catch {}
             if (!sec) sec = document.querySelector('section');
             if (sec) {
@@ -697,6 +737,10 @@
                     const n = normalizeCategorySegment(h2.textContent.trim());
                     if (n) categoryPath = [n];
                 }
+            }
+            // Debug
+            if (!categoryPath.length) {
+                console.warn('[VidDB] fallback sec not found, all h2:', Array.from(document.querySelectorAll('section h2')).map(h=>h.textContent.trim().slice(0,30)));
             }
         }
         // Build category string: Course Content > Academic Class(Basic to Indetails) > Subject
@@ -742,6 +786,10 @@
         if (title) title = title.replace(/\s+/g,' ').trim();
         if (category) category = category.replace(/\s+/g,' ').trim();
         if (category.length > 120) category = category.slice(0,120);
+        // Debug log when still uncategorized or title is generic
+        if (category === 'Uncategorized' || !title || /EdgeCourse BD/i.test(title)) {
+            console.warn('[VidDB] getNewSite fallback triggered', {title, category, categoryPath, headerP: headerP?.textContent?.trim()?.slice(0,60), h1: document.querySelector('h1')?.textContent?.trim()?.slice(0,60), lessonId: new URLSearchParams(location.search).get('lesson'), openRegions: document.querySelectorAll('div[role="region"]:not([hidden])').length, iframe: document.querySelector('iframe')?.src?.slice(0,80)});
+        }
         return {title, category, activeLessonEl};
         } catch(e) {
             console.warn('[VidDB] getNewSite failed', e);
@@ -878,7 +926,41 @@
             for (const iframe of iframePool){
                 const link=iframe.src||iframe.getAttribute('src')||'';
                 if(!link || link.startsWith('blob:')) continue;
-                let title = selTitle && selTitle.trim() ? selTitle.trim() : null;
+                let title = selTitle && selTitle.trim() && !/EdgeCourse BD/i.test(selTitle) ? selTitle.trim() : null;
+                // Robust title fallback chain - never use generic site title if better exists
+                if (!title || /EdgeCourse BD/i.test(title)) {
+                    // Try header below player - multiple selectors
+                    const titleSels = ['div.flex.items-center.gap-3.border-b.bg-brand-0 p','div.border-b.bg-brand-0 p','p.min-w-0.text-sm.font-semibold','div.overflow-hidden.rounded-xl p.font-semibold','div.overflow-hidden p.text-sm'];
+                    for (const sel of titleSels) {
+                        try {
+                            const hp = document.querySelector(sel);
+                            if (hp && hp.textContent.trim() && hp.textContent.trim().length > 3 && !/Course Progress|Course Outline|Course Content/i.test(hp.textContent)) { title = hp.textContent.trim(); break; }
+                        } catch {}
+                    }
+                    // Exhaustive Bengali search
+                    if (!title || /EdgeCourse BD/i.test(title)) {
+                        const allP = Array.from(document.querySelectorAll('p, h1, h2'));
+                        for (const p of allP) {
+                            const txt = p.textContent.trim();
+                            if (txt.length > 5 && txt.length < 150 && /অধ্যায়|Part\s*–|Lecture/i.test(txt) && p.offsetParent !== null) { title = txt; break; }
+                        }
+                    }
+                }
+                if (!title || /EdgeCourse BD/i.test(title)) {
+                    const h1 = document.querySelector('h1');
+                    const lessonId = new URLSearchParams(location.search).get('lesson');
+                    if (h1 && h1.textContent.trim() && !/EdgeCourse BD/i.test(h1.textContent)) {
+                        title = h1.textContent.trim();
+                        if (lessonId) {
+                            // Try to find more specific lesson title near video
+                            const cands = Array.from(document.querySelectorAll('p, h2, h3'));
+                            for (const p of cands) {
+                                const txt = p.textContent.trim();
+                                if (/অধ্যায়|Part\s*–|Lecture/i.test(txt) && txt.length < 120 && p.offsetParent !== null) { title = txt; break; }
+                            }
+                        }
+                    }
+                }
                 if (!title) title=(iframe.getAttribute('title')||iframe.getAttribute('data-media-title')||'').trim()||null;
                 if (!title){
                     try{
@@ -891,7 +973,14 @@
                         }
                     }catch{}
                 }
-                if (!title) title=document.title?document.title.trim().slice(0,120):null;
+                // Final fallback - avoid generic site title, use lessonId
+                if (!title || /EdgeCourse BD/i.test(title)) {
+                    const lessonId = new URLSearchParams(location.search).get('lesson');
+                    const h1b = document.querySelector('h1');
+                    if (h1b && lessonId) title = `${h1b.textContent.trim()} - Lesson ${lessonId}`;
+                    else if (h1b) title = h1b.textContent.trim();
+                    else title = document.title ? document.title.split('|')[0].trim().slice(0,80) : `Lesson ${lessonId || Date.now()}`;
+                }
                 if (!title) continue;
                 let mediaId=getMediaIdFromPoster(link) || (link.match(/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/i)?.[1]||null);
                 let poster=null, extraMediaTitle=null;
@@ -921,7 +1010,38 @@
                 scanPerformanceForStream();
                 const streamUrl=findBestStreamForMedia(mediaId);
                 const finalLink=streamUrl||link;
-                const category=selCategory||'Uncategorized';
+                let category = selCategory && selCategory !== 'Uncategorized' ? selCategory : null;
+                if (!category || category === 'Uncategorized') {
+                    // Try to recompute category more aggressively - selCategory may be stale Uncategorized
+                    try {
+                        const deepest = getDeepestOpenRegion();
+                        if (deepest) {
+                            const path = collectCategoryPath(deepest);
+                            if (path.length) category = path.map(s=> s.replace(/^\s*Academic Classes\s*-\s*/i,'').trim()).filter(Boolean).join(' > ');
+                        }
+                    } catch {}
+                    if (!category || category === 'Uncategorized') {
+                        try {
+                            const openHeadings = Array.from(document.querySelectorAll('button[data-state="open"] p.line-clamp-2, button[data-state="open"] p'))
+                                .map(p => p.textContent.trim()).map(s=> s.replace(/^\s*Academic Classes\s*-\s*/i,'').trim()).filter(Boolean);
+                            if (openHeadings.length) {
+                                // Deduplicate and join
+                                const uniq = [];
+                                for (const h of openHeadings) if (!uniq.includes(h) && h.length > 2 && h.length < 80) uniq.push(h);
+                                if (uniq.length) category = uniq.join(' > ');
+                            }
+                        } catch {}
+                    }
+                    if (!category || category === 'Uncategorized') {
+                        const h1b = document.querySelector('h1');
+                        if (h1b && h1b.textContent.trim() && !/EdgeCourse BD/i.test(h1b.textContent)) category = h1b.textContent.trim().slice(0,60);
+                        else {
+                            const h2b = document.querySelector('section h2');
+                            if (h2b && h2b.textContent.trim()) category = h2b.textContent.trim().slice(0,60);
+                        }
+                    }
+                    if (!category) category = 'Course Content';
+                }
                 saveEntry(title, finalLink, category, {mediaId, poster, streamUrl, rawSrc: link, via: streamUrl?'iframe+stream':'iframe'});
             }
         } catch(e){ console.warn('[VidDB] iframe err',e); }
@@ -945,14 +1065,43 @@
                 let streamUrl=findBestStreamForMedia(mediaId);
                 if(!streamUrl && rawSrc && isStreamUrl(rawSrc)) streamUrl=rawSrc;
                 let title=null;
-                if(mediaTitle&&mediaTitle.trim()) title=mediaTitle.trim();
-                else if(selTitle&&selTitle.trim()) title=selTitle.trim();
-                else if(poster) title=`Tenbyte-${mediaId||'video'}`;
+                if(mediaTitle&&mediaTitle.trim() && !/EdgeCourse BD/i.test(mediaTitle)) title=mediaTitle.trim();
+                else if(selTitle&&selTitle.trim() && !/EdgeCourse BD/i.test(selTitle)) title=selTitle.trim();
+                else {
+                    // Try header below player before falling back to poster
+                    try {
+                        const hp = document.querySelector('div.flex.items-center.gap-3.border-b.bg-brand-0 p') || document.querySelector('p.min-w-0.text-sm.font-semibold');
+                        if (hp && hp.textContent.trim() && !/Course Progress/i.test(hp.textContent)) title = hp.textContent.trim();
+                    } catch {}
+                    if (!title && poster) title=`Tenbyte-${mediaId||'video'}`;
+                    if (!title) {
+                        const h1b = document.querySelector('h1');
+                        if (h1b && h1b.textContent.trim() && !/EdgeCourse BD/i.test(h1b.textContent)) title = h1b.textContent.trim();
+                    }
+                }
                 if(title){
                     title=title.trim();
+                    if (/EdgeCourse BD/i.test(title)) {
+                        const h1c = document.querySelector('h1');
+                        if (h1c && !/EdgeCourse BD/i.test(h1c.textContent)) title = h1c.textContent.trim();
+                    }
                     let link=streamUrl||rawSrc||poster||(mediaId?`tenbyte://${mediaId}`:null);
                     if(link && !link.startsWith('blob:')){
-                        let category=selCategory||'Uncategorized';
+                        let category = selCategory && selCategory !== 'Uncategorized' ? selCategory : null;
+                        if (!category) {
+                            try {
+                                const deepest = getDeepestOpenRegion();
+                                if (deepest) {
+                                    const path = collectCategoryPath(deepest);
+                                    if (path.length) category = path.map(s=> s.replace(/^\s*Academic Classes\s*-\s*/i,'').trim()).join(' > ');
+                                }
+                            } catch {}
+                            if (!category) {
+                                const h1d = document.querySelector('h1');
+                                if (h1d) category = h1d.textContent.trim().slice(0,60);
+                            }
+                            if (!category) category = 'Course Content';
+                        }
                         saveEntry(title, link, category, {mediaId, poster, streamUrl, rawSrc, via: streamUrl?'video+stream':'video'});
                     }
                 }
