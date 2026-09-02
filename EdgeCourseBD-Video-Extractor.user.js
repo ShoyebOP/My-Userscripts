@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EdgeCourseBD Video Extractor & Manager (Categorized + Search + Sort)
 // @namespace    http://tampermonkey.net/
-// @version      3.3
-// @description  Extracts Vimeo / Tenbyte-Vidinfra (tb-player) links, categorizes them, with ultra-fast search and sorting. Dual player support + low-end optimized.
+// @version      3.4
+// @description  Extracts Vimeo / Tenbyte-Vidinfra (tb-player) links, categorizes them, with ultra-fast search and sorting. Dual player support + low-end optimized + iframe fix.
 // @author       ShoyebOP
 // @downloadURL  https://github.com/ShoyebOP/My-Userscripts/raw/refs/heads/main/EdgeCourseBD-Video-Extractor.user.js
 // @updateURL    https://github.com/ShoyebOP/My-Userscripts/raw/refs/heads/main/EdgeCourseBD-Video-Extractor.user.js
@@ -487,19 +487,61 @@
     }
 
     function getSelectedCourseInfo() {
-        const selectedContainer = document.querySelector('div.bg-brand-100');
+        // Try multiple selectors for selected lecture - site changed class from bg-brand-100 in newer builds
+        let selectedContainer = document.querySelector('div.bg-brand-100');
+        if (!selectedContainer) selectedContainer = document.querySelector('[class*="bg-brand-"][class*="100"]');
+        if (!selectedContainer) {
+            // Fallback: look for any element with aria-current or active class near course_tab_text
+            const candidates = Array.from(document.querySelectorAll('[aria-current="true"], [class*="active"], [class*="selected"]'));
+            for (const c of candidates) {
+                if (c.querySelector('span.course_tab_text') || c.querySelector('.course_tab_text')) { selectedContainer = c; break; }
+            }
+        }
+        if (!selectedContainer) {
+            // Last resort: first visible course_tab_text that looks like a lecture title (heuristic)
+            const all = Array.from(document.querySelectorAll('span.course_tab_text'));
+            // Prefer the one that is currently highlighted via background or border
+            for (const el of all) {
+                const parent = el.closest('div, button, a');
+                if (parent && getComputedStyle(parent).backgroundColor !== 'rgba(0, 0, 0, 0)') {
+                    // heuristic, but we just pick first if nothing else
+                }
+            }
+        }
         let title = null;
         let category = 'Uncategorized';
         if (selectedContainer) {
-            const titleEl = selectedContainer.querySelector('span.course_tab_text');
-            if (titleEl) title = titleEl.textContent.trim();
+            const titleEl = selectedContainer.querySelector('span.course_tab_text') || selectedContainer.querySelector('.course_tab_text') || selectedContainer;
+            if (titleEl) {
+                const t = titleEl.textContent ? titleEl.textContent.trim() : '';
+                if (t) title = t;
+                else if (selectedContainer.textContent) title = selectedContainer.textContent.trim().split('\n')[0].trim();
+            }
             const regionDiv = selectedContainer.closest('div[role="region"]');
             if (regionDiv && regionDiv.parentElement) {
-                const catTitleEl = regionDiv.parentElement.querySelector('h3 .course_tab_text');
+                const catTitleEl = regionDiv.parentElement.querySelector('h3 .course_tab_text') || regionDiv.parentElement.querySelector('h3');
                 if (catTitleEl) {
                     const cat = catTitleEl.textContent.trim();
                     if (cat) category = cat;
                 }
+            }
+            // Fallback category search upwards
+            if (category === 'Uncategorized') {
+                let p = selectedContainer.parentElement;
+                for (let i=0; i<4 && p; i++, p=p.parentElement) {
+                    const h3 = p.querySelector('h3 .course_tab_text');
+                    if (h3 && h3.textContent.trim()) { category = h3.textContent.trim(); break; }
+                    const h3b = p.querySelector('h3');
+                    if (h3b && h3b.textContent.trim().length < 80) { category = h3b.textContent.trim(); break; }
+                }
+            }
+        }
+        // If still no title, try data-media-title from video/iframe as last resort (will be used by saveEntry fallback)
+        if (!title) {
+            const v = document.querySelector('video[data-media-title]');
+            if (v) {
+                const mt = v.getAttribute('data-media-title');
+                if (mt && mt.trim()) title = mt.trim();
             }
         }
         return { title, category, selectedContainer };
@@ -512,6 +554,7 @@
 
     let lastSavedSig = '';
     let scanThrottle = null;
+    let tickCounter = 0;
     function scheduleScan() {
         if (scanThrottle) return;
         scanThrottle = setTimeout(()=>{ scanThrottle=null; scanForVideo(); }, 500);
@@ -522,29 +565,128 @@
         const db = safeGetDB();
         let dirty = false;
 
-        // 1) OLD Vimeo
-        try {
-            const iframe = document.querySelector('iframe[src*="player.vimeo.com"]');
-            if (iframe && selTitle && selTitle.trim()) {
-                const title = selTitle.trim();
-                const link = iframe.src;
-                if (link && !link.startsWith('blob:')) {
-                    const key = title; // keep legacy key for vimeo-only titles
-                    const cur = db[key];
-                    if (!cur || cur.link !== link || cur.category !== selCategory) {
-                        db[key] = { title, link, category: selCategory, page: location.href, savedAt: cur?.savedAt || Date.now() };
-                        dirty = true;
-                        console.log(`[VidDB][Vimeo] ${selCategory} -> ${title}`);
-                    }
+        // Debug tick - helps user diagnose why not capturing
+        tickCounter++;
+        if (tickCounter % 15 === 1) {
+            try {
+                const vid = document.querySelector('video.tb-player__video, video[data-media-id], .tb-player__video-container video');
+                const iframes = Array.from(document.querySelectorAll('iframe')).map(f=> (f.src||f.getAttribute('src')||'').slice(0,90));
+                console.log(`[VidDB] tick #${tickCounter} selTitle=${selTitle||'-'} selCat=${selCategory} video=${!!vid} iframes=${iframes.length}`, iframes);
+            } catch {}
+        }
+
+        function saveEntry(title, link, category, extra) {
+            if (!title || !title.trim() || !link || link.startsWith('blob:')) return false;
+            title = title.trim();
+            category = (category || 'Uncategorized').trim() || 'Uncategorized';
+            if (category === 'Uncategorized / Extra') category = 'Uncategorized';
+            let key = title;
+            const mediaId = extra.mediaId || null;
+            if (mediaId) {
+                let foundKey = null;
+                for (const [k,v] of Object.entries(db)) if (v.mediaId === mediaId) { foundKey = k; break; }
+                if (foundKey) key = foundKey;
+                else if (db[title] && db[title].mediaId && db[title].mediaId !== mediaId) {
+                    key = `${category}::${title}`;
+                    if (db[key] && db[key].mediaId !== mediaId) key = `${category}::${title}::${mediaId.slice(0,8)}`;
+                }
+            } else if (db[title] && db[title].category !== category) {
+                key = `${category}::${title}`;
+            }
+            const cur = db[key];
+            const sig = `${link}|${category}|${mediaId||''}|${extra.poster||''}|${extra.streamUrl||''}`;
+            if (!cur || cur.link !== link || cur.category !== category || cur.mediaId !== mediaId || cur.poster !== extra.poster || cur.streamUrl !== extra.streamUrl) {
+                if (sig !== lastSavedSig) {
+                    db[key] = { title, link, category, page: location.href, savedAt: cur?.savedAt || Date.now(), mediaId: mediaId || cur?.mediaId, poster: extra.poster || cur?.poster, streamUrl: extra.streamUrl || undefined, rawSrc: extra.rawSrc || undefined };
+                    lastSavedSig = sig;
+                    dirty = true;
+                    console.log(`[VidDB][${extra.via||'save'}] [${category}] ${title} id=${mediaId||'-'} link=${link.slice(0,70)}`);
+                    return true;
                 }
             }
-        } catch(e) { console.warn('[VidDB] vimeo err', e); }
+            return false;
+        }
 
-        // 2) NEW tb-player
+        // 1) IFRAME players - PRIMARY (cross-origin tb-player is inside iframe, outer page cannot see <video>)
+        // Covers old Vimeo + new Vidinfra/Tenbyte. This was the root cause of "not capturing" - previous version only checked video element on outer page.
+        try {
+            const allIframes = Array.from(document.querySelectorAll('iframe'));
+            const candidates = allIframes.filter(f => {
+                const s = (f.src || f.getAttribute('src') || '').toLowerCase();
+                if (!s || s.startsWith('blob:')) return false;
+                return /player\.vimeo\.com|vidinfra|tenbyte|tenbytecdn|player\./i.test(s) || s.includes('player');
+            });
+            // Fallback: if no candidate but there is exactly one iframe (likely the player), use it
+            const iframePool = candidates.length ? candidates : (allIframes.length === 1 ? allIframes : []);
+
+            for (const iframe of iframePool) {
+                const link = iframe.src || iframe.getAttribute('src') || '';
+                if (!link || link.startsWith('blob:')) continue;
+                // Title: sidebar is primary, then iframe attrs, then document.title fallback (don't skip if sidebar missing - previous version returned early)
+                let title = selTitle && selTitle.trim() ? selTitle.trim() : null;
+                if (!title) title = (iframe.getAttribute('title') || iframe.getAttribute('data-media-title') || '').trim() || null;
+                if (!title) {
+                    // Try to peek inside iframe if same-origin (will throw if cross-origin, that's fine)
+                    try {
+                        const idoc = iframe.contentDocument;
+                        if (idoc) {
+                            const v = idoc.querySelector('video[data-media-title], video.tb-player__video');
+                            const mt = v && (v.getAttribute('data-media-title') || v.dataset.mediaTitle);
+                            if (mt && mt.trim()) title = mt.trim();
+                            if (!title) {
+                                const poster = v && (v.getAttribute('poster')||v.poster);
+                                const mid = poster && getMediaIdFromPoster(poster);
+                                if (mid) title = `Tenbyte-${mid}`;
+                            }
+                        }
+                    } catch {}
+                }
+                if (!title) title = document.title ? document.title.trim().slice(0,120) : null;
+                if (!title) continue;
+
+                let mediaId = getMediaIdFromPoster(link) || (link.match(/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/i)?.[1] || null);
+                let poster = null;
+                let extraMediaTitle = null;
+                try {
+                    const idoc = iframe.contentDocument;
+                    if (idoc) {
+                        const v = idoc.querySelector('video.tb-player__video, video[data-media-id], video[poster]');
+                        if (v) {
+                            poster = v.getAttribute('poster') || v.poster || null;
+                            const mid2 = v.getAttribute('data-media-id') || v.dataset.mediaId;
+                            if (mid2) mediaId = mid2;
+                            else if (poster && !mediaId) mediaId = getMediaIdFromPoster(poster);
+                            const mt2 = v.getAttribute('data-media-title') || v.dataset.mediaTitle;
+                            if (mt2 && mt2.trim()) { extraMediaTitle = mt2.trim(); title = mt2.trim(); }
+                        }
+                    }
+                } catch {}
+                // If still no mediaId, try to find tb-player video on outer page (some embeds are not iframe)
+                if (!mediaId && !poster) {
+                    const outerVideo = document.querySelector('video.tb-player__video[poster], video[data-media-id]');
+                    if (outerVideo) {
+                        poster = outerVideo.getAttribute('poster') || outerVideo.poster || null;
+                        mediaId = outerVideo.getAttribute('data-media-id') || outerVideo.dataset.mediaId || getMediaIdFromPoster(poster);
+                        const mt3 = outerVideo.getAttribute('data-media-title') || outerVideo.dataset.mediaTitle;
+                        if (mt3 && mt3.trim()) title = mt3.trim();
+                    }
+                }
+                if (extraMediaTitle) title = extraMediaTitle;
+                scanPerformanceForStream();
+                const streamUrl = findBestStreamForMedia(mediaId);
+                const finalLink = streamUrl || link;
+                const category = selCategory || 'Uncategorized';
+                saveEntry(title, finalLink, category, { mediaId, poster, streamUrl, rawSrc: link, via: streamUrl ? 'iframe+stream' : 'iframe' });
+            }
+        } catch(e) { console.warn('[VidDB] iframe err', e); }
+
+        // 2) Direct video element on outer page (same-origin fallback, no iframe)
         try {
             scanPerformanceForStream();
             const video = document.querySelector('video.tb-player__video, video[data-media-id], .tb-player__video-container video, video[data-media-title], video[poster*="tenbytecdn.com"]');
-            if (video) {
+            // Only handle if not already handled via iframe and video is not inside an iframe element (outer page)
+            const isInsideIframeEl = video && video.closest && !!video.closest('iframe');
+            if (video && !isInsideIframeEl) {
                 let mediaId = video.getAttribute('data-media-id') || video.dataset.mediaId || null;
                 let mediaTitle = video.getAttribute('data-media-title') || video.dataset.mediaTitle || null;
                 if (mediaTitle && !mediaTitle.trim()) mediaTitle = null;
@@ -573,32 +715,8 @@
                             const catEl = document.querySelector('h3 .course_tab_text');
                             if (catEl && catEl.textContent.trim()) category = catEl.textContent.trim();
                         }
-                        // Stable key: prefer mediaId unique, else namespaced title
-                        let key = title;
-                        if (mediaId) {
-                            // check if any existing entry already has this mediaId (dedupe)
-                            let foundKey = null;
-                            for (const [k,v] of Object.entries(db)) if (v.mediaId===mediaId) { foundKey=k; break; }
-                            if (foundKey) key = foundKey;
-                            else if (db[title] && db[title].mediaId && db[title].mediaId !== mediaId) {
-                                // collision on title with different mediaId -> namespace
-                                key = `${category}::${title}`;
-                                if (db[key] && db[key].mediaId !== mediaId) key = `${category}::${title}::${mediaId.slice(0,8)}`;
-                            }
-                        } else if (db[title] && db[title].category !== category) {
-                            key = `${category}::${title}`;
-                        }
-                        const cur = db[key];
-                        const sig = `${link}|${category}|${mediaId||''}|${poster||''}|${streamUrl||''}`;
-                        if (!cur || cur.link !== link || cur.category !== category || cur.mediaId !== mediaId || cur.poster !== poster || cur.streamUrl !== streamUrl) {
-                            // also avoid churn: if sig same as last save, skip
-                            if (sig !== lastSavedSig) {
-                                db[key] = { title, link, category, page: location.href, savedAt: cur?.savedAt || Date.now(), mediaId: mediaId||cur?.mediaId, poster: poster||cur?.poster, streamUrl: streamUrl||undefined, rawSrc: rawSrc||undefined };
-                                lastSavedSig = sig;
-                                dirty = true;
-                                console.log(`[VidDB][TB] [${category}] ${title} id=${mediaId} ${streamUrl?'stream':'poster'}`);
-                            }
-                        }
+                        // Use saveEntry helper for dedup logic
+                        saveEntry(title, link, category, { mediaId, poster, streamUrl, rawSrc, via: streamUrl ? 'video+stream' : 'video' });
                     }
                 }
             }
@@ -703,27 +821,28 @@
         migrateDB();
         createUI();
         // Throttled polling + visibility-aware
-        let iv = setInterval(()=>{ if (!document.hidden) scanForVideo(); }, 3000);
+        let iv = setInterval(()=>{ if (!document.hidden) scanForVideo(); }, 2500);
         document.addEventListener('visibilitychange', ()=>{
             if (document.hidden) { clearInterval(iv); iv=null; }
-            else if (!iv) { scanForVideo(); iv=setInterval(()=>{ if (!document.hidden) scanForVideo(); }, 3000); }
+            else if (!iv) { scanForVideo(); iv=setInterval(()=>{ if (!document.hidden) scanForVideo(); }, 2500); }
         });
-        setTimeout(scanForVideo, 900);
-        setTimeout(scanForVideo, 3200);
-        // Throttled observer: only watch relevant subtree, debounced
+        setTimeout(scanForVideo, 800);
+        setTimeout(scanForVideo, 2000);
+        setTimeout(scanForVideo, 4000);
+        // Quick console hint for debugging not-capturing
+        console.log('[VidDB] init done. If not capturing, check: document.querySelectorAll("iframe").length, document.querySelector("video") and run localStorage GM debug. See console ticks every ~15 scans.');
+        // Throttled observer: watch iframes src + video attrs, and general DOM for player swap
         try {
             const target = document.querySelector('.tb-player__video-container') || document.body;
             const obs = new MutationObserver(()=> scheduleScan());
-            obs.observe(target, { childList:true, subtree:true, attributes:true, attributeFilter:['src','poster','data-media-id','data-media-title'] });
-            // Fallback: if container not yet present, observe body but throttled
-            if (target !== document.body) {
-                const bodyObs = new MutationObserver(()=>{
-                    if (!document.querySelector('.tb-player__video-container')) return;
-                    scheduleScan();
-                });
-                bodyObs.observe(document.body, { childList:true, subtree:true });
-                setTimeout(()=> bodyObs.disconnect(), 30000); // stop after 30s to save CPU
-            }
+            obs.observe(target, { childList:true, subtree:true, attributes:true, attributeFilter:['src','poster','data-media-id','data-media-title','title'] });
+            // Permanent observer for iframe src changes (player navigation is src swap)
+            const iframeObs = new MutationObserver(()=> scheduleScan());
+            iframeObs.observe(document.body, { childList:true, subtree:true, attributes:true, attributeFilter:['src'] });
+            // Also hook popstate / pushState for SPA navigation
+            const origPush = history.pushState;
+            history.pushState = function(...a){ const r=origPush.apply(this,a); scheduleScan(); setTimeout(scanForVideo, 600); return r; };
+            window.addEventListener('popstate', ()=>{ scheduleScan(); setTimeout(scanForVideo, 600); });
         } catch(e) {}
     }
     if (document.body) init();
