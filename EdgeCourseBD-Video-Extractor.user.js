@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EdgeCourseBD Video Extractor & Manager (Categorized + Search + Sort)
 // @namespace    http://tampermonkey.net/
-// @version      4.9
-// @description  Extracts Vimeo / Tenbyte-Vidinfra (tb-player) links, auto-categorizes nested Course Content > Academic Class > Subject (all parents, Academic Classes - stripped) - full hierarchy fix.
+// @version      5.1
+// @description  Extracts Vimeo / Tenbyte-Vidinfra (tb-player) links, auto-categorizes full hierarchy (all parents) - robust DOM fix (Course Content > Academic Class > Subject) via DOM+API, robust title fix.
 // @author       ShoyebOP
 // @downloadURL  https://github.com/ShoyebOP/My-Userscripts/raw/refs/heads/main/EdgeCourseBD-Video-Extractor.user.js
 // @updateURL    https://github.com/ShoyebOP/My-Userscripts/raw/refs/heads/main/EdgeCourseBD-Video-Extractor.user.js
@@ -622,18 +622,14 @@
     function getHeadingForRegion(region) {
         if (!region) return null;
         try {
-            // Heading is previousElementSibling (h3) which contains button > p
             let headingBtn = region.previousElementSibling;
             if (headingBtn) {
-                // Try multiple selectors for heading text
                 const p = headingBtn.querySelector('p.line-clamp-2') || headingBtn.querySelector('p.font-semibold') || headingBtn.querySelector('p');
                 if (p && p.textContent.trim()) return p.textContent.trim();
-                // Fallback: button text without count badge - clone and remove count span
                 try {
                     const clone = headingBtn.cloneNode(true);
                     const countBadge = clone.querySelector('span.ml-auto');
                     if (countBadge) countBadge.remove();
-                    // Remove svg
                     const svg = clone.querySelector('svg');
                     if (svg) svg.remove();
                     const txt = clone.textContent.trim().split('\n')[0].trim();
@@ -642,30 +638,57 @@
                 const txt2 = headingBtn.textContent.trim().split('\n')[0].trim();
                 if (txt2 && txt2.length > 2 && txt2.length < 80) return txt2;
             }
-            // Alternative: region is inside a vertical, the vertical's h3 is heading
             const v = region.closest('div[data-orientation="vertical"]');
             if (v) {
                 let b = null;
-                try { b = v.querySelector('h3 button p.line-clamp-2'); } catch {}
+                try { b = v.querySelector('h3 > button p.line-clamp-2'); } catch {}
+                if (!b) try { b = v.querySelector('h3 button p.line-clamp-2'); } catch {}
                 if (!b) try { b = v.querySelector('h3 button p'); } catch {}
                 if (!b) try { b = v.querySelector('h3 p'); } catch {}
                 if (b && b.textContent.trim()) return b.textContent.trim();
+                try {
+                    const btn = v.querySelector('button');
+                    if (btn && btn.textContent.trim().length < 80) {
+                        const txt = btn.textContent.trim().split('\n')[0].trim();
+                        if (txt) return txt;
+                    }
+                } catch {}
+            }
+            const parent = region.parentElement;
+            if (parent) {
+                const prev = parent.previousElementSibling;
+                if (prev) {
+                    const p2 = prev.querySelector('p');
+                    if (p2 && p2.textContent.trim()) return p2.textContent.trim();
+                }
             }
         } catch {}
         return null;
     }
     function collectCategoryPath(activeEl) {
         if (!activeEl) return [];
-        // Collect ALL ancestor regions of activeEl, deepest first
+        // Collect ALL ancestor regions of activeEl, deepest first - handle both role and data-state
+        const isRegion = el => el && (el.getAttribute('role')==='region' || el.hasAttribute('data-state') || el.hasAttribute('hidden') || el.getAttribute('data-orientation')==='vertical');
+        const findRegion = el => el.closest('div[role="region"], div[data-state], div[data-orientation="vertical"] > div');
         const regions = [];
-        let r = activeEl.closest('div[role="region"]');
-        // If activeEl itself is a region (when called with openRegion), include it
-        if (!r && activeEl.getAttribute && activeEl.getAttribute('role')==='region') r = activeEl;
+        let r = activeEl.closest('div[role="region"]') || activeEl.closest('div[data-state]') || activeEl.closest('div[data-orientation="vertical"] > div');
+        if (!r && activeEl.getAttribute && (activeEl.getAttribute('role')==='region' || activeEl.hasAttribute('data-state'))) r = activeEl;
         while (r) {
-            regions.unshift(r); // unshift to have outermost first later
+            // Only consider real content regions (not the vertical wrapper itself)
+            if (r.getAttribute('role')==='region' || r.hasAttribute('data-state') || r.hasAttribute('hidden')) {
+                regions.unshift(r);
+            }
             const parent = r.parentElement;
             if (!parent) break;
-            r = parent.closest('div[role="region"]');
+            r = parent.closest('div[role="region"]') || parent.closest('div[data-state]');
+            if (!r) {
+                // Try to find next ancestor that is a region via vertical
+                const v = parent.closest('div[data-orientation="vertical"]');
+                if (v) {
+                    const pr = v.parentElement?.closest('div[role="region"]') || v.parentElement?.closest('div[data-state]');
+                    r = pr;
+                }
+            }
         }
         const path = [];
         const seen = new Set();
@@ -689,7 +712,10 @@
         return path;
     }
     function getDeepestOpenRegion() {
-        const open = Array.from(document.querySelectorAll('div[role="region"]:not([hidden])'));
+        // Prefer not hidden, but also consider data-state="open"
+        let open = Array.from(document.querySelectorAll('div[role="region"]:not([hidden])'));
+        if (!open.length) open = Array.from(document.querySelectorAll('div[data-state="open"]'));
+        if (!open.length) open = Array.from(document.querySelectorAll('div[role="region"]')).filter(el=> el.offsetParent !== null);
         if (!open.length) return null;
         // Depth = number of ancestor regions + total descendants
         let best = null, bestDepth = -1;
@@ -703,16 +729,24 @@
         return best;
     }
     function findActiveLessonEl() {
-        // First try to find lesson by header title (most reliable for current video)
+        // First try to find lesson by header title (most reliable for current video) - search all visible candidates
         try {
-            const hp = document.querySelector('div.flex.items-center.gap-3.border-b.bg-brand-0 p') || document.querySelector('p.min-w-0.text-sm.font-semibold');
+            const hp = document.querySelector('div.flex.items-center.gap-3.border-b.bg-brand-0 p') || document.querySelector('p.min-w-0.text-sm.font-semibold') || document.querySelector('div.overflow-hidden p');
             if (hp && hp.textContent.trim()) {
                 const ht = hp.textContent.trim();
-                const cands = Array.from(document.querySelectorAll('div[role="region"] a, div[role="region"] button'));
+                // Search in all regions and also in any visible list
+                const cands = Array.from(document.querySelectorAll('div[role="region"] a, div[role="region"] button, div[role="region"] [class*="flex"], section a, section button'));
                 for (const c of cands) {
                     if (c.closest('h3')) continue;
                     const txt = c.textContent.trim();
+                    if (!txt || txt.length < 3 || txt.length > 150) continue;
                     if (txt === ht || txt.includes(ht) || ht.includes(txt)) return c;
+                }
+                // Also try any element in the page with same text
+                const all = Array.from(document.querySelectorAll('a, button'));
+                for (const c of all) {
+                    if (c.closest('h3')) continue;
+                    if (c.textContent.trim() === ht) return c;
                 }
             }
         } catch {}
@@ -763,6 +797,36 @@
         }
         return null;
     }
+    function extractFromNextData() {
+        // Try to extract title/category from Next.js payload (self.__next_f or __NEXT_DATA__)
+        try {
+            // Check __NEXT_DATA__ script
+            const nd = document.getElementById('__NEXT_DATA__');
+            if (nd && nd.textContent) {
+                const j = JSON.parse(nd.textContent);
+                const str = JSON.stringify(j);
+                // Look for lesson title pattern near current lessonId
+                const lessonId = new URLSearchParams(location.search).get('lesson');
+                if (lessonId && str.includes(lessonId)) {
+                    // Try to find title near lessonId in the JSON string
+                    const idx = str.indexOf(lessonId);
+                    const snippet = str.slice(Math.max(0, idx-2000), idx+2000);
+                    const titleMatch = snippet.match(/"title"\s*:\s*"([^"]*অধ্যায়[^"]*)"/) || snippet.match(/"title"\s*:\s*"([^"]*Part[^"]*)"/);
+                    if (titleMatch) return { title: titleMatch[1] };
+                }
+            }
+            // Check self.__next_f pushes (React Flight)
+            const scripts = Array.from(document.querySelectorAll('script'));
+            for (const s of scripts) {
+                const txt = s.textContent || '';
+                if (txt.includes('lesson') && txt.includes(lessonId || '346')) {
+                    const m = txt.match(/"title"\s*:\s*"([^"]*অধ্যায়[^"]*)"/);
+                    if (m) return { title: m[1] };
+                }
+            }
+        } catch {}
+        return null;
+    }
     function getNewSiteTitleAndCategory() {
         try {
         let title = null;
@@ -777,10 +841,23 @@
             'div.overflow-hidden.rounded-xl p.font-semibold',
             'div.overflow-hidden p.text-sm',
             'h1 + div p',
+            'div.bg-white p.font-semibold', // generic fallback
+            'p.text-sm.font-semibold', // even more generic
         ];
         for (const sel of titleSelectors) {
-            try { headerP = document.querySelector(sel); if (headerP && headerP.textContent.trim().length > 3) break; } catch {}
+            try { headerP = document.querySelector(sel); if (headerP && headerP.textContent.trim().length > 3 && !/Course Progress|Course Outline|Course Content/i.test(headerP.textContent)) break; } catch {}
             headerP = null;
+        }
+        // If not found via selector, search all p for Bengali/Part
+        if (!headerP) {
+            const allP = Array.from(document.querySelectorAll('p'));
+            for (const p of allP) {
+                const txt = p.textContent.trim();
+                if (txt.length > 5 && txt.length < 150 && /অধ্যায়|Part\s*–/.test(txt) && p.offsetParent !== null) {
+                    // Prefer visible and near video
+                    if (p.closest('div.overflow-hidden') || p.closest('div.bg-white')) { headerP = p; break; }
+                }
+            }
         }
         if (headerP && headerP.textContent.trim()) {
             const t = headerP.textContent.trim();
@@ -804,6 +881,11 @@
                 }
             }
         }
+        // Try Next.js data as fallback
+        if (!title || /EdgeCourse BD/i.test(title)) {
+            const nd = extractFromNextData();
+            if (nd && nd.title) title = nd.title;
+        }
         if (!title) {
             const h1 = document.querySelector('h1');
             if (h1 && h1.textContent.trim()) {
@@ -812,7 +894,6 @@
                 if (!/EdgeCourse BD/i.test(h1txt) && h1txt.length < 80) {
                     title = h1txt;
                     if (lessonId) {
-                        // Try to find more specific lesson title near video before using h1
                         const more = Array.from(document.querySelectorAll('p, h2, h3')).find(p=>{
                             const txt=p.textContent.trim();
                             return /অধ্যায়|Part/.test(txt) && txt.length<120 && p.offsetParent!==null;
