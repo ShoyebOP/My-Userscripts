@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EdgeCourseBD Video Extractor & Manager (Categorized + Search + Sort)
 // @namespace    http://tampermonkey.net/
-// @version      4.6
-// @description  Extracts Vimeo / Tenbyte-Vidinfra (tb-player) links, auto-categorizes nested Course Content > Academic Class > Subject (all parents, Academic Classes - stripped) - robust title/category fix.
+// @version      4.7
+// @description  Extracts Vimeo / Tenbyte-Vidinfra (tb-player) links, auto-categorizes nested Course Content > Academic Class > Subject (all parents, Academic Classes - stripped) - nested UI fix.
 // @author       ShoyebOP
 // @downloadURL  https://github.com/ShoyebOP/My-Userscripts/raw/refs/heads/main/EdgeCourseBD-Video-Extractor.user.js
 // @updateURL    https://github.com/ShoyebOP/My-Userscripts/raw/refs/heads/main/EdgeCourseBD-Video-Extractor.user.js
@@ -275,7 +275,14 @@
         .vid-category-header { background: #1e1e2e; padding: 8px 10px; display: flex; align-items: center; gap: 8px; cursor: pointer; border-bottom: 1px solid transparent; user-select: none; }
         .vid-category-header:hover { background: #313244; }
         .vid-cat-toggle { font-size: 11px; color: #89b4fa; width: 14px; text-align: center; flex-shrink: 0; }
-        .vid-cat-title { font-weight: 700; color: #f9e2af; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .vid-cat-title { font-weight: 700; color: #f9e2af; font-size: 13px; white-space: normal; word-break: break-word; line-height: 1.3; }
+        .vid-cat-title .vid-breadcrumb { font-weight: 400; color: #6c7086; font-size: 11px; }
+        .vid-cat-title .vid-leaf { color: #f9e2af; }
+        .vid-subgroup { margin: 6px 8px 6px 12px; border-left: 2px solid #313244; padding-left: 6px; }
+        .vid-subgroup .vid-category-group { margin-bottom: 6px; border-color: #3a3a4a; }
+        .vid-subgroup .vid-category-header { background: #252537; padding: 6px 8px; }
+        .vid-subgroup .vid-category-header:hover { background: #2e2e44; }
+        .vid-subgroup .vid-subgroup .vid-category-header { background: #1e1e2e; font-size: 12px; }
         .vid-category-content { display: none; background: #181825; padding: 0; }
         .vid-table { width: 100%; border-collapse: collapse; text-align: left; font-size: 12px; }
         .vid-table td { border-bottom: 1px solid #262637; padding: 6px 8px; word-break: break-word; }
@@ -349,17 +356,33 @@
         const sortEl=document.getElementById('vid-sort');
         const sortMethod=sortEl?sortEl.value:'date-asc';
         if (!container) return;
-        const grouped={};
+
+        // Build hierarchical tree from "A > B > C" categories
+        const root = { name: null, children: {}, videos: [], fullPath: '' };
+        let totalVideos = 0;
         for (const [key,data] of Object.entries(db)){
             const title=(data.title||key||'').trim(); if(!title) continue;
-            const cat=(data.category||'Uncategorized').trim()||'Uncategorized';
-            if (!grouped[cat]) grouped[cat]=[];
-            grouped[cat].push([key,data]);
+            const catRaw=(data.category||'Uncategorized').trim()||'Uncategorized';
+            const parts = catRaw.split(' > ').map(s=>s.trim()).filter(Boolean);
+            let node = root;
+            let curPath = '';
+            for (const part of parts) {
+                curPath = curPath ? curPath + ' > ' + part : part;
+                if (!node.children[part]) node.children[part] = { name: part, children: {}, videos: [], fullPath: curPath };
+                node = node.children[part];
+            }
+            node.videos.push([key,data]);
+            totalVideos++;
         }
-        const cats=Object.keys(grouped).sort((a,b)=>a.localeCompare(b));
-        const frag=document.createDocumentFragment();
-        for (const catName of cats){
-            const vids=grouped[catName];
+
+        // Helper to count total videos in subtree
+        function countSubtree(node){
+            let c = node.videos.length;
+            for (const child of Object.values(node.children)) c += countSubtree(child);
+            return c;
+        }
+        // Sort helper
+        function sortVideos(vids){
             vids.sort((a,b)=>{
                 const da=a[1], db2=b[1];
                 const ta=(da.title||a[0]), tb=(db2.title||b[0]);
@@ -367,71 +390,216 @@
                 if (sortMethod==='date-desc') return (db2.savedAt||0)-(da.savedAt||0);
                 return (da.savedAt||0)-(db2.savedAt||0);
             });
-            const groupDiv=document.createElement('div');
-            groupDiv.className='vid-category-group';
-            groupDiv.dataset.catName=catName.toLowerCase();
-            groupDiv.dataset.catRaw=catName;
-            const header=document.createElement('div');
-            header.className='vid-category-header';
-            const toggle=document.createElement('span');
-            toggle.className='vid-cat-toggle'; toggle.textContent='▶';
-            const cb=document.createElement('input');
-            cb.type='checkbox'; cb.className='vid-checkbox cat-checkbox'; cb.dataset.category=catName;
-            const titleEl=document.createElement('span');
-            titleEl.className='vid-cat-title'; titleEl.textContent=`${catName} (${vids.length})`; titleEl.title=catName;
-            header.append(toggle,cb,titleEl);
-            const content=document.createElement('div');
-            content.className='vid-category-content';
-            const table=document.createElement('table'); table.className='vid-table';
-            const tbody=document.createElement('tbody'); tbody.className='vid-tbody';
-            for (const [key,data] of vids){
-                const title=data.title||key;
-                const tr=document.createElement('tr');
-                tr.dataset.vidName=title.toLowerCase(); tr.dataset.key=key;
-                const tdCb=document.createElement('td'); tdCb.style.cssText='width:28px; text-align:center;';
-                const rowCb=document.createElement('input'); rowCb.type='checkbox'; rowCb.className='vid-checkbox row-checkbox'; rowCb.dataset.key=key; rowCb.dataset.name=title; rowCb.dataset.category=catName;
-                tdCb.appendChild(rowCb);
-                const tdTitle=document.createElement('td'); tdTitle.textContent=title; tdTitle.title=title;
-                const tdLink=document.createElement('td');
-                const displayLink=data.link||data.streamUrl||data.poster||'';
-                const a=document.createElement('a'); a.href=displayLink; a.target='_blank'; a.rel='noopener'; a.style.color='#89b4fa';
-                a.textContent=displayLink?displayLink.split('?')[0].slice(0,40)+(displayLink.length>40?'…':''):'no-link';
-                a.title=[displayLink, data.mediaId?`id:${data.mediaId}`:'', data.poster?`poster:${data.poster}`:''].filter(Boolean).join('\n');
-                tdLink.appendChild(a);
-                if (data.mediaId){ const badge=document.createElement('span'); badge.textContent=`[${data.mediaId.slice(0,8)}]`; badge.style.cssText='color:#6c7086; font-size:10px; margin-left:6px;'; tdLink.appendChild(badge); }
-                tr.append(tdCb,tdTitle,tdLink); tbody.appendChild(tr);
-            }
-            table.appendChild(tbody); content.appendChild(table);
-            groupDiv.append(header,content); frag.appendChild(groupDiv);
         }
+
+        const frag=document.createDocumentFragment();
+
+        function renderNode(node, depth){
+            const isRoot = !node.name;
+            const fragLocal = document.createDocumentFragment();
+            // Render children first (subcategories)
+            const childNames = Object.keys(node.children).sort((a,b)=>a.localeCompare(b));
+            for (const childName of childNames){
+                const child = node.children[childName];
+                const totalInChild = countSubtree(child);
+                const groupDiv=document.createElement('div');
+                groupDiv.className='vid-category-group';
+                const fullCat = child.fullPath;
+                groupDiv.dataset.catName=fullCat.toLowerCase();
+                groupDiv.dataset.catRaw=fullCat;
+                // Also store leaf name for search
+                groupDiv.dataset.leafName = child.name.toLowerCase();
+
+                const header=document.createElement('div');
+                header.className='vid-category-header';
+                // Depth-based left border color
+                if (depth === 0) header.style.borderLeft = '3px solid #89b4fa';
+                else if (depth === 1) header.style.borderLeft = '3px solid #a6e3a1';
+                else header.style.borderLeft = '3px solid #f9e2af';
+
+                const toggle=document.createElement('span');
+                toggle.className='vid-cat-toggle'; toggle.textContent='▶';
+                const cb=document.createElement('input');
+                cb.type='checkbox'; cb.className='vid-checkbox cat-checkbox'; cb.dataset.category=fullCat;
+                const titleEl=document.createElement('span');
+                titleEl.className='vid-cat-title';
+                // Show breadcrumb for leaf, but for intermediate show just name
+                // For depth 0, show full top name; for nested, show leaf name with breadcrumb tooltip
+                const isLeafCategory = Object.keys(child.children).length === 0;
+                if (depth === 0 && isLeafCategory) {
+                    titleEl.textContent=`${fullCat} (${totalInChild})`;
+                } else {
+                    // Show leaf name + count, tooltip shows full path
+                    titleEl.innerHTML = `<span class="vid-leaf">${child.name}</span> <span style="color:#6c7086; font-weight:400;">(${totalInChild})</span>`;
+                    if (fullCat !== child.name) {
+                        const bc = document.createElement('span');
+                        bc.className='vid-breadcrumb';
+                        bc.textContent = ' — ' + fullCat;
+                        bc.style.fontSize='10px';
+                        titleEl.appendChild(bc);
+                    }
+                }
+                titleEl.title=fullCat;
+
+                header.append(toggle,cb,titleEl);
+                const content=document.createElement('div');
+                content.className='vid-category-content';
+
+                // Render child subgroups recursively inside a wrapper
+                if (Object.keys(child.children).length > 0) {
+                    const subWrapper = document.createElement('div');
+                    subWrapper.className='vid-subgroup';
+                    const childFrag = renderNode(child, depth+1);
+                    subWrapper.appendChild(childFrag);
+                    content.appendChild(subWrapper);
+                }
+                // Render videos directly in this category (leaf videos)
+                if (child.videos.length > 0) {
+                    sortVideos(child.videos);
+                    const table=document.createElement('table'); table.className='vid-table';
+                    const tbody=document.createElement('tbody'); tbody.className='vid-tbody';
+                    for (const [key,data] of child.videos){
+                        const title=data.title||key;
+                        const tr=document.createElement('tr');
+                        tr.dataset.vidName=title.toLowerCase(); tr.dataset.key=key;
+                        tr.dataset.catPath = fullCat.toLowerCase();
+                        const tdCb=document.createElement('td'); tdCb.style.cssText='width:28px; text-align:center;';
+                        const rowCb=document.createElement('input'); rowCb.type='checkbox'; rowCb.className='vid-checkbox row-checkbox'; rowCb.dataset.key=key; rowCb.dataset.name=title; rowCb.dataset.category=fullCat;
+                        tdCb.appendChild(rowCb);
+                        const tdTitle=document.createElement('td'); tdTitle.textContent=title; tdTitle.title=title;
+                        const tdLink=document.createElement('td');
+                        const displayLink=data.link||data.streamUrl||data.poster||'';
+                        const a=document.createElement('a'); a.href=displayLink; a.target='_blank'; a.rel='noopener'; a.style.color='#89b4fa';
+                        a.textContent=displayLink?displayLink.split('?')[0].slice(0,40)+(displayLink.length>40?'…':''):'no-link';
+                        a.title=[displayLink, data.mediaId?`id:${data.mediaId}`:'', data.poster?`poster:${data.poster}`:''].filter(Boolean).join('\n');
+                        tdLink.appendChild(a);
+                        if (data.mediaId){ const badge=document.createElement('span'); badge.textContent=`[${data.mediaId.slice(0,8)}]`; badge.style.cssText='color:#6c7086; font-size:10px; margin-left:6px;'; tdLink.appendChild(badge); }
+                        tr.append(tdCb,tdTitle,tdLink); tbody.appendChild(tr);
+                    }
+                    table.appendChild(tbody);
+                    content.appendChild(table);
+                }
+
+                groupDiv.append(header,content);
+                fragLocal.appendChild(groupDiv);
+            }
+            // If root has direct videos (should not happen with hierarchical, but handle)
+            if (isRoot && node.videos.length > 0) {
+                sortVideos(node.videos);
+                const groupDiv=document.createElement('div');
+                groupDiv.className='vid-category-group';
+                groupDiv.dataset.catName='uncategorized';
+                groupDiv.dataset.catRaw='Uncategorized';
+                const header=document.createElement('div');
+                header.className='vid-category-header';
+                const toggle=document.createElement('span'); toggle.className='vid-cat-toggle'; toggle.textContent='▶';
+                const cb=document.createElement('input'); cb.type='checkbox'; cb.className='vid-checkbox cat-checkbox'; cb.dataset.category='Uncategorized';
+                const titleEl=document.createElement('span'); titleEl.className='vid-cat-title'; titleEl.textContent=`Uncategorized (${node.videos.length})`;
+                header.append(toggle,cb,titleEl);
+                const content=document.createElement('div'); content.className='vid-category-content';
+                const table=document.createElement('table'); table.className='vid-table';
+                const tbody=document.createElement('tbody');
+                for (const [key,data] of node.videos){
+                    const title=data.title||key;
+                    const tr=document.createElement('tr'); tr.dataset.vidName=title.toLowerCase(); tr.dataset.key=key;
+                    const tdCb=document.createElement('td'); tdCb.style.cssText='width:28px; text-align:center;';
+                    const rowCb=document.createElement('input'); rowCb.type='checkbox'; rowCb.className='vid-checkbox row-checkbox'; rowCb.dataset.key=key; rowCb.dataset.name=title; rowCb.dataset.category='Uncategorized';
+                    tdCb.appendChild(rowCb);
+                    const tdTitle=document.createElement('td'); tdTitle.textContent=title; tdTitle.title=title;
+                    const tdLink=document.createElement('td');
+                    const displayLink=data.link||data.streamUrl||data.poster||'';
+                    const a=document.createElement('a'); a.href=displayLink; a.target='_blank'; a.rel='noopener'; a.style.color='#89b4fa';
+                    a.textContent=displayLink?displayLink.split('?')[0].slice(0,40)+(displayLink.length>40?'…':''):'no-link';
+                    tdLink.appendChild(a);
+                    tr.append(tdCb,tdTitle,tdLink); tbody.appendChild(tr);
+                }
+                table.appendChild(tbody); content.appendChild(table);
+                groupDiv.append(header,content); fragLocal.appendChild(groupDiv);
+            }
+            return fragLocal;
+        }
+
+        frag.appendChild(renderNode(root, 0));
         container.replaceChildren(frag);
+        // Update stats
+        const stats = document.getElementById('vid-stats');
+        if (stats) {
+            const catCount = Object.keys(safeGetDB()).length ? Object.keys(root.children).length : 0;
+            // Count total nested categories
+            let totalCats = 0;
+            function countCats(n){ for(const c of Object.values(n.children)){ totalCats++; countCats(c); } }
+            countCats(root);
+            stats.textContent = `${totalVideos} videos • ${totalCats} categories`;
+        }
         triggerSearch();
     }
 
     function triggerSearch(){
         const termEl=document.getElementById('vid-search'); if(!termEl) return;
         const term=termEl.value.trim().toLowerCase();
-        const groups=document.querySelectorAll('.vid-category-group');
-        groups.forEach(group=>{
-            const catName=group.dataset.catName||'';
-            const rows=group.querySelectorAll('tbody tr');
-            let visible=0;
-            const catMatch=term && catName.includes(term);
-            rows.forEach(row=>{
-                const name=row.dataset.vidName||'';
-                const show=!term || catMatch || name.includes(term);
-                row.style.display=show?'':'none'; if(show) visible++;
+        if (!term) {
+            // Reset: collapse all, show all groups/rows
+            document.querySelectorAll('.vid-category-group').forEach(g=>{
+                g.style.display='';
+                const c=g.querySelector(':scope > .vid-category-content');
+                if(c){ c.style.display='none'; const t=g.querySelector(':scope > .vid-category-header .vid-cat-toggle'); if(t) t.textContent='▶'; }
+                g.querySelectorAll('tbody tr').forEach(r=>r.style.display='');
             });
-            const hasVisible=visible>0;
-            group.style.display=!term || hasVisible?'':'none';
+            return;
+        }
+        // For nested, process leaves first then bubble up
+        const allGroups = Array.from(document.querySelectorAll('.vid-category-group')).reverse();
+        const visibleGroups = new Set();
+        for (const group of allGroups){
+            const catName=group.dataset.catName||'';
+            const leafName=group.dataset.leafName||'';
+            // Check if group itself matches
+            const catMatch = catName.includes(term) || leafName.includes(term);
+            // Check rows directly in this group (not in nested subgroups)
+            const directRows = group.querySelectorAll(':scope > .vid-category-content > table > tbody > tr');
+            let visibleRows = 0;
+            directRows.forEach(row=>{
+                const name=row.dataset.vidName||'';
+                const show = catMatch || name.includes(term);
+                row.style.display=show?'':'none'; if(show) visibleRows++;
+            });
+            // Check if any child subgroup is visible
+            const childGroups = group.querySelectorAll(':scope > .vid-category-content > .vid-subgroup > .vid-category-group');
+            let childVisible = false;
+            for (const ch of childGroups) if (ch.style.display !== 'none') childVisible = true;
+            // Also check any descendant row visible (for parents whose rows are in nested)
+            const anyDescendantVisible = group.querySelector('tbody tr:not([style*="display: none"])') !== null;
+
+            const hasVisible = catMatch || visibleRows>0 || childVisible || anyDescendantVisible;
+            if (hasVisible) visibleGroups.add(group);
+
+            // Show/hide group
+            group.style.display = hasVisible ? '' : 'none';
             if (hasVisible){
-                const content=group.querySelector('.vid-category-content');
-                const toggle=group.querySelector('.vid-cat-toggle');
-                if (!content||!toggle) return;
-                const shouldOpen=term!=='' && visible>0;
-                if (term!==''){ content.style.display=shouldOpen?'block':'none'; toggle.textContent=shouldOpen?'▼':'▶'; }
+                const content=group.querySelector(':scope > .vid-category-content');
+                const toggle=group.querySelector(':scope > .vid-category-header .vid-cat-toggle');
+                if (content) content.style.display='block';
+                if (toggle) toggle.textContent='▼';
+                // Ensure parents will be considered visible in next iteration (since we reverse, parents come after children)
+            } else {
+                const content=group.querySelector(':scope > .vid-category-content');
+                const toggle=group.querySelector(':scope > .vid-category-header .vid-cat-toggle');
+                if (content) content.style.display='none';
+                if (toggle) toggle.textContent='▶';
             }
-        });
+        }
+        // Ensure all ancestors of visible groups are also visible (in case directRows check missed)
+        for (const g of visibleGroups){
+            let p = g.parentElement?.closest('.vid-category-group');
+            while(p){
+                p.style.display='';
+                const c=p.querySelector(':scope > .vid-category-content');
+                const t=p.querySelector(':scope > .vid-category-header .vid-cat-toggle');
+                if(c) c.style.display='block';
+                if(t) t.textContent='▼';
+                p = p.parentElement?.closest('.vid-category-group');
+            }
+        }
     }
 
     // --- NEW SITE TITLE/CATEGORY EXTRACTION (nested: Course Content > Academic Class(Basic to Indetails) > Subject > Class) ---
@@ -1159,8 +1327,18 @@
             if(!e.target.classList.contains('cat-checkbox')) return;
             const isChecked=e.target.checked;
             const group=e.target.closest('.vid-category-group');
-            group.querySelectorAll('.row-checkbox').forEach(cb=>{
-                const tr=cb.closest('tr'); if(tr&&tr.style.display==='none') return; cb.checked=isChecked;
+            // Check all descendant row-checkboxes and child category checkboxes
+            group.querySelectorAll('.row-checkbox, .cat-checkbox').forEach(cb=>{
+                if (cb === e.target) return;
+                const tr=cb.closest('tr');
+                const grp=cb.closest('.vid-category-group');
+                if (tr && tr.style.display==='none') return;
+                if (grp && grp.style.display==='none') return;
+                // Only check visible
+                const isRowHidden = cb.closest('tr')?.style.display === 'none';
+                const isGroupHidden = cb.closest('.vid-category-group')?.style.display === 'none';
+                if (isRowHidden || isGroupHidden) return;
+                cb.checked=isChecked;
             });
         });
         function cleanName(name){ return name.replace(/[,;|]/g,'_').replace(/_+/g,'_').trim(); }
