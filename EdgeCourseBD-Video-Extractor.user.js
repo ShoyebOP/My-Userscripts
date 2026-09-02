@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EdgeCourseBD Video Extractor & Manager (Categorized + Search + Sort)
 // @namespace    http://tampermonkey.net/
-// @version      4.2
-// @description  Extracts Vimeo / Tenbyte-Vidinfra (tb-player) links, auto-categorizes nested Course Content > Academic Class > Subject (Academic Classes - stripped, all parents), low-end optimized.
+// @version      4.3
+// @description  Extracts Vimeo / Tenbyte-Vidinfra (tb-player) links, auto-categorizes nested Course Content > Academic Class > Subject (all parents, Academic Classes - stripped), low-end optimized - capture fix.
 // @author       ShoyebOP
 // @downloadURL  https://github.com/ShoyebOP/My-Userscripts/raw/refs/heads/main/EdgeCourseBD-Video-Extractor.user.js
 // @updateURL    https://github.com/ShoyebOP/My-Userscripts/raw/refs/heads/main/EdgeCourseBD-Video-Extractor.user.js
@@ -453,24 +453,32 @@
     }
     function getHeadingForRegion(region) {
         if (!region) return null;
-        // Heading is previousElementSibling (h3) which contains button > p.line-clamp-2
-        let headingBtn = region.previousElementSibling;
-        if (headingBtn) {
-            const p = headingBtn.querySelector('p.line-clamp-2');
-            if (p && p.textContent.trim()) return p.textContent.trim();
-            // Fallback: button text without count badge - clone and remove count span
-            const clone = headingBtn.cloneNode(true);
-            const countBadge = clone.querySelector('span.ml-auto');
-            if (countBadge) countBadge.remove();
-            const txt = clone.textContent.trim().split('\n')[0].trim();
-            if (txt) return txt;
-        }
-        // Alternative: region is inside a vertical, the vertical's h3 is heading
-        const v = region.closest('div[data-orientation="vertical"]');
-        if (v) {
-            const b = v.querySelector(':scope > h3 > button p.line-clamp-2') || v.querySelector('h3 p.line-clamp-2');
-            if (b && b.textContent.trim()) return b.textContent.trim();
-        }
+        try {
+            // Heading is previousElementSibling (h3) which contains button > p.line-clamp-2
+            let headingBtn = region.previousElementSibling;
+            if (headingBtn) {
+                const p = headingBtn.querySelector('p.line-clamp-2');
+                if (p && p.textContent.trim()) return p.textContent.trim();
+                // Fallback: button text without count badge - clone and remove count span
+                try {
+                    const clone = headingBtn.cloneNode(true);
+                    const countBadge = clone.querySelector('span.ml-auto');
+                    if (countBadge) countBadge.remove();
+                    const txt = clone.textContent.trim().split('\n')[0].trim();
+                    if (txt) return txt;
+                } catch {}
+                const txt2 = headingBtn.textContent.trim().split('\n')[0].trim();
+                if (txt2) return txt2;
+            }
+            // Alternative: region is inside a vertical, the vertical's h3 is heading
+            const v = region.closest('div[data-orientation="vertical"]');
+            if (v) {
+                let b = null;
+                try { b = v.querySelector('h3 > button p.line-clamp-2'); } catch {}
+                if (!b) try { b = v.querySelector('h3 p.line-clamp-2'); } catch {}
+                if (b && b.textContent.trim()) return b.textContent.trim();
+            }
+        } catch {}
         return null;
     }
     function collectCategoryPath(activeEl) {
@@ -569,11 +577,14 @@
         return null;
     }
     function getNewSiteTitleAndCategory() {
+        try {
         let title = null;
         let categoryPath = [];
 
         // Title: header below player is most reliable for current video class name
-        const headerP = document.querySelector('div.flex.items-center.gap-3.border-b.bg-brand-0 p');
+        let headerP = null;
+        try { headerP = document.querySelector('div.flex.items-center.gap-3.border-b.bg-brand-0 p'); } catch {}
+        if (!headerP) try { headerP = document.querySelector('p.min-w-0.text-sm.font-semibold'); } catch {}
         if (headerP && headerP.textContent.trim()) {
             const t = headerP.textContent.trim();
             if (t.length > 3 && t.length < 200) title = t;
@@ -617,7 +628,10 @@
         }
         // Fallback to section h2
         if (!categoryPath.length) {
-            const sec = document.querySelector('section#section_course\\ content') || document.querySelector('section');
+            let sec = null;
+            try { sec = document.querySelector('section[id="section_course content"]'); } catch {}
+            if (!sec) try { sec = document.querySelector('section[id*="section_course"]'); } catch {}
+            if (!sec) sec = document.querySelector('section');
             if (sec) {
                 const h2 = sec.querySelector('h2');
                 if (h2) {
@@ -646,6 +660,10 @@
         if (category) category = category.replace(/\s+/g,' ').trim();
         if (category.length > 120) category = category.slice(0,120);
         return {title, category, activeLessonEl};
+        } catch(e) {
+            console.warn('[VidDB] getNewSite failed', e);
+            return {title: null, category: 'Uncategorized', activeLessonEl: null};
+        }
     }
 
     function getSelectedCourseInfoLegacy() {
@@ -710,7 +728,22 @@
 
     function scanForVideo() {
         if (document.hidden) return;
-        const {title: selTitle, category: selCategory} = getSelectedCourseInfo();
+        let selTitle = null, selCategory = 'Uncategorized';
+        try {
+            const info = getSelectedCourseInfo();
+            selTitle = info.title; selCategory = info.category || 'Uncategorized';
+        } catch(e) {
+            console.warn('[VidDB] getSelectedCourseInfo failed', e);
+            // Fallback to headerP directly so capture never stops
+            try {
+                const hp = document.querySelector('div.flex.items-center.gap-3.border-b.bg-brand-0 p');
+                if (hp && hp.textContent.trim()) selTitle = hp.textContent.trim();
+            } catch {}
+            if (!selTitle) {
+                const h1 = document.querySelector('h1');
+                if (h1) selTitle = h1.textContent.trim();
+            }
+        }
         const db = safeGetDB();
         let dirty = false;
 
