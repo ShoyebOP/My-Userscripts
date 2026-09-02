@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EdgeCourseBD Video Extractor & Manager (Categorized + Search + Sort)
 // @namespace    http://tampermonkey.net/
-// @version      4.1
-// @description  Extracts Vimeo / Tenbyte-Vidinfra (tb-player) links, auto-categorizes nested Course Content > Academic Class > Subject (Academic Classes - stripped), low-end optimized.
+// @version      4.2
+// @description  Extracts Vimeo / Tenbyte-Vidinfra (tb-player) links, auto-categorizes nested Course Content > Academic Class > Subject (Academic Classes - stripped, all parents), low-end optimized.
 // @author       ShoyebOP
 // @downloadURL  https://github.com/ShoyebOP/My-Userscripts/raw/refs/heads/main/EdgeCourseBD-Video-Extractor.user.js
 // @updateURL    https://github.com/ShoyebOP/My-Userscripts/raw/refs/heads/main/EdgeCourseBD-Video-Extractor.user.js
@@ -447,57 +447,79 @@
         t = t.replace(/^\s*Academic Classes\s*-\s*/i, '').trim();
         // Ignore generic toggle counts like "12" alone
         if (/^\d+$/.test(t)) return null;
+        // Ignore icon-only or empty
+        if (t.length < 2) return null;
         return t;
+    }
+    function getHeadingForRegion(region) {
+        if (!region) return null;
+        // Heading is previousElementSibling (h3) which contains button > p.line-clamp-2
+        let headingBtn = region.previousElementSibling;
+        if (headingBtn) {
+            const p = headingBtn.querySelector('p.line-clamp-2');
+            if (p && p.textContent.trim()) return p.textContent.trim();
+            // Fallback: button text without count badge - clone and remove count span
+            const clone = headingBtn.cloneNode(true);
+            const countBadge = clone.querySelector('span.ml-auto');
+            if (countBadge) countBadge.remove();
+            const txt = clone.textContent.trim().split('\n')[0].trim();
+            if (txt) return txt;
+        }
+        // Alternative: region is inside a vertical, the vertical's h3 is heading
+        const v = region.closest('div[data-orientation="vertical"]');
+        if (v) {
+            const b = v.querySelector(':scope > h3 > button p.line-clamp-2') || v.querySelector('h3 p.line-clamp-2');
+            if (b && b.textContent.trim()) return b.textContent.trim();
+        }
+        return null;
     }
     function collectCategoryPath(activeEl) {
         if (!activeEl) return [];
+        // Collect ALL ancestor regions of activeEl, deepest first
+        const regions = [];
+        let r = activeEl.closest('div[role="region"]');
+        // If activeEl itself is a region (when called with openRegion), include it
+        if (!r && activeEl.getAttribute && activeEl.getAttribute('role')==='region') r = activeEl;
+        while (r) {
+            regions.unshift(r); // unshift to have outermost first later
+            const parent = r.parentElement;
+            if (!parent) break;
+            r = parent.closest('div[role="region"]');
+        }
         const path = [];
         const seen = new Set();
-        let cur = activeEl;
-        // Walk up through nested regions
-        for (let depth=0; depth<6 && cur; depth++) {
-            const region = cur.closest('div[role="region"]');
-            if (!region) break;
-            // Heading is previousElementSibling (h3) or parent's first button
-            let headingText = null;
-            const headingBtn = region.previousElementSibling;
-            if (headingBtn) {
-                const p = headingBtn.querySelector('p.line-clamp-2');
-                if (p && p.textContent.trim()) headingText = p.textContent.trim();
-                else {
-                    // Button text without count badge
-                    const txt = headingBtn.textContent.trim().split('\n')[0].trim();
-                    if (txt) headingText = txt;
-                }
-            }
-            // Also check parent vertical's heading if not found
-            if (!headingText) {
-                const v = region.closest('div[data-orientation="vertical"]');
-                if (v) {
-                    const b = v.querySelector(':scope > h3 > button p.line-clamp-2');
-                    if (b && b.textContent.trim()) headingText = b.textContent.trim();
-                }
-            }
-            const norm = normalizeCategorySegment(headingText);
-            if (norm && !seen.has(norm)) { path.unshift(norm); seen.add(norm); }
-            // Add section h2 as top level if not yet added
-            const sec = region.closest('section');
-            if (sec) {
-                const h2 = sec.querySelector('h2');
-                if (h2) {
-                    const secTxt = h2.textContent.trim();
-                    const n2 = normalizeCategorySegment(secTxt);
-                    if (n2 && !seen.has(n2)) { path.unshift(n2); seen.add(n2); }
-                }
-            }
-            // Move to outer region
-            const parent = region.parentElement;
-            if (!parent || parent === cur) break;
-            cur = parent;
-            if (!cur.closest('div[role="region"]')) break;
+        for (const region of regions) {
+            const raw = getHeadingForRegion(region);
+            const norm = normalizeCategorySegment(raw);
+            if (norm && !seen.has(norm)) { path.push(norm); seen.add(norm); }
         }
-        // Also ensure top course name not needed - we already have section h2
+        // Prepend section h2 (Course Content) if not already in path
+        // Find outermost region's section
+        const outermost = regions[0];
+        const sec = outermost ? outermost.closest('section') : activeEl.closest('section');
+        if (sec) {
+            const h2 = sec.querySelector('h2');
+            if (h2) {
+                const secTxt = h2.textContent.trim();
+                const n2 = normalizeCategorySegment(secTxt);
+                if (n2 && !seen.has(n2)) { path.unshift(n2); seen.add(n2); }
+            }
+        }
         return path;
+    }
+    function getDeepestOpenRegion() {
+        const open = Array.from(document.querySelectorAll('div[role="region"]:not([hidden])'));
+        if (!open.length) return null;
+        // Depth = number of ancestor regions + total descendants
+        let best = null, bestDepth = -1;
+        for (const el of open) {
+            let depth = 0, cur = el;
+            while (cur) { const p = cur.parentElement?.closest('div[role="region"]'); if (p) { depth++; cur = p; } else break; }
+            // Prefer deeper (more nested) and more content
+            const score = depth * 10 + (el.querySelectorAll('a, button').length > 0 ? 1 : 0);
+            if (score > bestDepth) { bestDepth = score; best = el; }
+        }
+        return best;
     }
     function findActiveLessonEl() {
         const lessonId = new URLSearchParams(location.search).get('lesson');
@@ -518,23 +540,31 @@
         // Active lesson has distinct active styling: bg-brand-500 text-white or ring or aria-current
         let el = document.querySelector('[aria-current="true"]');
         if (el) return el;
-        // Look inside open regions for an element with active background
-        const openRegions = Array.from(document.querySelectorAll('div[role="region"]:not([hidden])'));
+        // Look inside open regions for an element with active background - search deepest first
+        const openRegions = Array.from(document.querySelectorAll('div[role="region"]:not([hidden])')).reverse();
         for (const r of openRegions) {
-            // Common active pattern: bg-brand-500 or bg-brand-0 with text-brand
-            const cand = r.querySelector('[class*="bg-brand-500"], [class*="bg-brand-0"][class*="text-brand"], [class*="ring-brand"]');
-            if (cand && cand.textContent.trim().length < 120) return cand;
-            // Fallback: any button that is not a category heading but a lesson row
+            // Common active pattern: bg-brand-500 or bg-brand-0 with text-brand, or ring-brand, or data-state active
+            const cand = r.querySelector('[class*="bg-brand-500"], [class*="bg-brand-0"][class*="text-brand"], [class*="ring-brand"], [data-state="on"], [class*="bg-white"][class*="shadow"]');
+            if (cand && cand.textContent.trim().length < 120 && !cand.closest('h3')) return cand;
+            // Fallback: any button that is not a category heading but a lesson row - look for rows with lesson-like text
             const rows = r.querySelectorAll('a, button');
             for (const row of rows) {
                 if (row.closest('h3')) continue; // skip category heading
-                if (row.textContent.trim().length > 0 && row.textContent.trim().length < 100) {
-                    // Heuristic: lesson row often has play icon or small text, check if it is inside region and not a heading
-                    if (row.querySelector('svg') || row.textContent.includes('Class') || row.textContent.includes('Lecture') || row.textContent.includes('অধ্যায়')) {
-                        return row;
+                const txt = row.textContent.trim();
+                if (txt.length > 0 && txt.length < 100) {
+                    // Heuristic: lesson row often has play icon or small text
+                    if (row.querySelector('svg') || /অধ্যায়|Class|Lecture|Chapter|Part\s*–|Part\s*-/.test(txt)) {
+                        // Ensure row is leaf (not containing another region heading)
+                        if (!row.querySelector('p.line-clamp-2')) return row;
                     }
                 }
             }
+        }
+        // Fallback: deepest open region's first leaf row
+        const deepest = getDeepestOpenRegion();
+        if (deepest) {
+            const leaf = deepest.querySelector('a, button');
+            if (leaf && !leaf.closest('h3') && leaf.textContent.trim().length < 120) return leaf;
         }
         return null;
     }
@@ -565,7 +595,7 @@
             else if (h1 && h1.textContent.trim().length < 80) title = h1.textContent.trim();
         }
 
-        // Category path via active lesson hierarchy
+        // Category path via active lesson hierarchy - captures ALL ancestors (Course Content > Academic Class > Subject)
         const activeEl = findActiveLessonEl();
         if (activeEl) {
             categoryPath = collectCategoryPath(activeEl);
@@ -576,10 +606,14 @@
                 if (!title || lessonTxt.length < title.length + 20) title = lessonTxt;
             }
         }
-        // If no active lesson, try open region's path
+        // If no active lesson, try deepest open region's path (captures nested Academic Class > Subject)
         if (!categoryPath.length) {
-            const openRegion = document.querySelector('div[role="region"]:not([hidden])');
-            if (openRegion) categoryPath = collectCategoryPath(openRegion);
+            const deepest = getDeepestOpenRegion();
+            if (deepest) categoryPath = collectCategoryPath(deepest);
+            else {
+                const openRegion = document.querySelector('div[role="region"]:not([hidden])');
+                if (openRegion) categoryPath = collectCategoryPath(openRegion);
+            }
         }
         // Fallback to section h2
         if (!categoryPath.length) {
